@@ -16,18 +16,19 @@
 
 Package.describe({
   summary: "Sandstorm database layer",
-  version: "0.1.0"
+  version: "0.1.0",
 });
 
 Npm.depends({ "content-type": "1.0.1" });
 
 Package.onUse(function (api) {
+  api.use("ecmascript");
   api.use(["mongo", "random", "check", "underscore"], ["client", "server"]);
   api.use(["accounts-base", "fongandrew:find-and-modify", "http"], ["server"]);
-  api.use(["jparker:crypto-sha256", "sandstorm-identicons"], ["client"]);
+  api.use(["sha"], ["client"]);
+  api.use("sandstorm-identicons", ["client", "server"]);
 
   api.addFiles(["db.js", "profile.js"]);
-  api.addFiles(["user.js", "migrations.js"], "server");
   api.export("SandstormDb");
 });
 

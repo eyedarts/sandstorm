@@ -24,13 +24,15 @@
 #       spk          Raw SPK file (immutable).
 #       metadata     Serialized Package.VerifiedInfo (immutable).
 #       status       Serialized SubmissionStatus (mutable).
+#   apps/
+#     <appId>        Symlink to latest approved package version.
 #   keybase/
 #     <keyId>        Serialized KeybaseIdentity for a person.
 #   descriptions     Serialized ShortDescriptionOverrides
 #   www/
 #     apps/
-#       index        GZIP-JSON of AppIndexForMatker.
-#       <appId>      GZIP-JSON of AppDetailsForMarket for given app.
+#       index.json   JSON of AppIndexForMatker.
+#       <appId>.json JSON of AppDetailsForMarket for given app.
 #     images/
 #       <imageId>    An image.
 #     packages/
@@ -78,6 +80,7 @@ struct AppIndexForMarket {
     upstreamAuthor @11 :Text;
     shortDescription @10 :Text;
     createdAt @12 :Text;   # date like "2014-08-21T09:19:29.761Z"
+    versionNumber @13 :UInt32;
   }
 }
 
@@ -162,15 +165,22 @@ const pkgdef :Package.PackageDefinition = (
 
   manifest = (
     appTitle = (defaultText = "Sandstorm App Index"),
-    appVersion = 0,
-    appMarketingVersion = (defaultText = "0.0.0"),
+    appVersion = 3,
+    appMarketingVersion = (defaultText = "2016-02-22"),
 
     actions = [
       ( title = (defaultText = "New Sandstorm App Index"),
         command = (argv = ["/app-index", "--init"])
       )
     ],
-    continueCommand = (argv = ["/app-index"])
+    continueCommand = (argv = ["/app-index"]),
+
+    metadata = (
+      author = (contactEmail = "support@sandstorm.io"),
+      categories = [developerTools],
+      license = (openSource = apache2),
+      shortDescription = (defaultText = "App Market")
+    )
   ),
 
   fileList = "app-index-sandstorm-files.list",

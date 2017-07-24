@@ -22,6 +22,21 @@ fi
 
 . $SANDSTORM_HOME/sandstorm.conf
 
+# If HTTPS_PORT is specified, then probably the BASE_URL contains HTTPS_PORT
+# as well, and run-dev.sh does not know how to listen on HTTPS, so tell the
+# user to disable that.
+if [ -n "${HTTPS_PORT:-}" ] ; then
+  echo "Please remove the HTTPS_PORT= line in your Sandstorm configuration" >&2
+  echo "since run-dev.sh does not support HTTPS." >&2
+fi
+
+# If PORT specifies two ports to listen on, this script only listens on the
+# first, since it calls Meteor directly, and Meteor has no ability to listen
+# on multiple ports.
+if [[ "${PORT:-}" =~ ^(.*?), ]] ; then
+  PORT=${BASH_REMATCH[1]} >&2
+fi
+
 if [ "$SERVER_USER" != "$USER" ]; then
   echo "Please change your Sandstorm installation to be owned by your own user" >&2
   echo "account. E.g. run as root:" >&2
@@ -41,7 +56,9 @@ if ! $SANDSTORM_HOME/sandstorm status >/dev/null 2>&1; then
   exit 1
 fi
 
-if curl http://localhost:$PORT >/dev/null 2>&1; then
+BIND_IP=${BIND_IP:-127.0.0.1}
+
+if curl http://$BIND_IP:$PORT >/dev/null 2>&1; then
   echo "Please shut down your Sandstorm front-end:" >&2
   echo "  sudo $SANDSTORM_HOME/sandstorm stop-fe" >&2
   exit 1
@@ -67,15 +84,15 @@ cat > $SETTINGS << __EOF__
     "isTesting": true,
     "wildcardHost": "$WILDCARD_HOST",
     "quotaEnabled": ${QUOTA_ENABLED:-false},
-    "stripePublicKey": "${STRIPE_PUBLIC_KEY:-}"
+    "stripePublicKey": "${STRIPE_PUBLIC_KEY:-}",
+    "outOfBeta": ${OUT_OF_BETA:-false},
+    "smtpListenPort": ${SMTP_LISTEN_PORT:-30025}
   },
   "home": "$SANDSTORM_HOME",
-  "stripeKey": "${STRIPE_KEY:-}"
+  "stripeKey": "${STRIPE_KEY:-}",
+  "mailchimpListId": "${MAILCHIMP_LIST_ID:-}",
+  "mailchimpKey": "${MAILCHIMP_KEY:-}"
 }
 __EOF__
 
-# Work-around for problem where Meteor's bundled npm prefers the system gyp
-# over its own bundled version, and the system gyp doesn't work.
-export PYTHONPATH=$("$SCRIPT_DIR/../find-meteor-dev-bundle.sh")/lib/node_modules/npm/node_modules/node-gyp/gyp/pylib
-
-exec meteor run -p $PORT --settings $SETTINGS
+exec meteor run --port=$BIND_IP:$PORT --settings $SETTINGS

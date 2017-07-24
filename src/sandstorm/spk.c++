@@ -19,6 +19,7 @@
 #include "spk.h"
 #include <kj/debug.h>
 #include <kj/io.h>
+#include <kj/encoding.h>
 #include <capnp/serialize.h>
 #include <capnp/serialize-packed.h>
 #include <capnp/compat/json.h>
@@ -34,6 +35,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <sandstorm/package.capnp.h>
+#include <sandstorm/appid-replacements.capnp.h>
 #include <stdlib.h>
 #include <dirent.h>
 #include <set>
@@ -55,6 +57,8 @@
 #include "union-fs.h"
 #include "send-fd.h"
 #include "util.h"
+#include "id-to-text.h"
+#include "appid-replacements.h"
 
 namespace sandstorm {
 
@@ -63,207 +67,14 @@ typedef kj::byte byte;
 static const uint64_t APP_SIZE_LIMIT = 1ull << 30;
 // For now, we will refuse to unpack an app over 1 GB (decompressed size).
 
-// =======================================================================================
-// base32 encode/decode derived from google-authenticator code, Apache 2.0 license:
-//   https://code.google.com/p/google-authenticator/source/browse/libpam/base32.c
-//
-// Modifications:
-// - Prefer to output in lower-case letters.
-// - Use Douglas Crockford's alphabet mapping, except instead of excluding 'u', consider 'B' to
-//   be a misspelling of '8'.
-// - Use a lookup table for decoding (in addition to encoding).  Generate this table
-//   programmatically at compile time.  C++14 constexpr is awesome.
-// - Convert to KJ style.
-//
-// TODO(test):  This could use a unit test.
-
-constexpr char BASE32_ENCODE_TABLE[] = "0123456789acdefghjkmnpqrstuvwxyz";
-
-kj::String base32Encode(kj::ArrayPtr<const byte> data) {
-  // We'll need a character for every 5 bits, rounded up.
-  auto result = kj::heapString((data.size() * 8 + 4) / 5);
-
-  uint count = 0;
-  if (data.size() > 0) {
-    uint buffer = data[0];
-    uint next = 1;
-    uint bitsLeft = 8;
-    while (bitsLeft > 0 || next < data.size()) {
-      if (bitsLeft < 5) {
-        if (next < data.size()) {
-          buffer <<= 8;
-          buffer |= data[next++] & 0xFF;
-          bitsLeft += 8;
-        } else {
-          // No more input; pad with zeros.
-          uint pad = 5 - bitsLeft;
-          buffer <<= pad;
-          bitsLeft += pad;
-        }
-      }
-      uint index = 0x1F & (buffer >> (bitsLeft - 5));
-      bitsLeft -= 5;
-      KJ_ASSERT(count < result.size());
-      result[count++] = BASE32_ENCODE_TABLE[index];
-    }
-  }
-
-  return result;
-}
-
-class Base32Decoder {
-public:
-  constexpr Base32Decoder(): decodeTable() {
-    // Cool, we can generate our lookup table at compile time.
-
-    for (byte& b: decodeTable) {
-      b = 255;
-    }
-
-    for (uint i = 0; i < sizeof(BASE32_ENCODE_TABLE) - 1; i++) {
-      unsigned char c = BASE32_ENCODE_TABLE[i];
-      decodeTable[c] = i;
-      if ('a' <= c && c <= 'z') {
-        decodeTable[c - 'a' + 'A'] = i;
-      }
-    }
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wchar-subscripts"
-    decodeTable['o'] = decodeTable['O'] = 0;
-    decodeTable['i'] = decodeTable['I'] = 1;
-    decodeTable['l'] = decodeTable['L'] = 1;
-    decodeTable['b'] = decodeTable['B'] = 8;
-#pragma GCC diagnostic pop
-  }
-
-  constexpr bool verifyTable() const {
-    // Verify that all letters and digits have a decoding.
-    //
-    // Oh cool, this can also be done at compile time, and then checked with a static_assert below.
-    //
-    // C++14 is awesome.
-
-    for (unsigned char c = '0'; c <= '9'; c++) {
-      if (decodeTable[c] == 255) return false;
-    }
-    for (unsigned char c = 'a'; c <= 'z'; c++) {
-      if (decodeTable[c] == 255) return false;
-    }
-    for (unsigned char c = 'A'; c <= 'Z'; c++) {
-      if (decodeTable[c] == 255) return false;
-    }
-    return true;
-  }
-
-  kj::Array<byte> decode(kj::StringPtr encoded) const {
-    // We intentionally round the size down.  Leftover bits are presumably zero.
-    auto result = kj::heapArray<byte>(encoded.size() * 5 / 8);
-
-    uint buffer = 0;
-    uint bitsLeft = 0;
-    uint count = 0;
-    for (char c: encoded) {
-      byte decoded = decodeTable[(byte)c];
-      KJ_ASSERT(decoded <= 32, "Invalid base32.");
-
-      buffer <<= 5;
-      buffer |= decoded;
-      bitsLeft += 5;
-      if (bitsLeft >= 8) {
-        KJ_ASSERT(count < encoded.size());
-        bitsLeft -= 8;
-        result[count++] = buffer >> bitsLeft;
-      }
-    }
-
-    buffer &= (1 << bitsLeft) - 1;
-    KJ_REQUIRE(buffer == 0, "Base32 decode failed: extra bits at end.");
-
-    return result;
-  }
-
-private:
-  byte decodeTable[256];
-};
-
-constexpr Base32Decoder BASE32_DECODER;
-static_assert(BASE32_DECODER.verifyTable(), "Base32 decode table is incomplete.");
-
-kj::String appIdString(spk::AppId::Reader appId) {
-  auto bytes = capnp::AnyStruct::Reader(appId).getDataSection();
-  KJ_ASSERT(bytes.size() == 32);
-  return base32Encode(bytes);
-}
-
-kj::String packageIdString(spk::PackageId::Reader packageId) {
-  auto bytes = capnp::AnyStruct::Reader(packageId).getDataSection();
-  KJ_ASSERT(bytes.size() == 16);
-  return hexEncode(bytes);
-}
-
-static kj::Maybe<uint> parseHexDigit(char c) {
-  if ('0' <= c && c <= '9') {
-    return static_cast<uint>(c - '0');
-  } else if ('a' <= c && c <= 'f') {
-    return static_cast<uint>(c - 'a');
-  } else {
-    return nullptr;
-  }
-}
-
-static bool tryParsePackageId(kj::StringPtr in, spk::PackageId::Builder out) {
-  if (in.size() != 32) return false;
-
-  auto bytes = capnp::AnyStruct::Builder(kj::mv(out)).getDataSection();
-  KJ_ASSERT(bytes.size() == 16);
-
-  for (auto i: kj::indices(bytes)) {
-    byte b = 0;
-    KJ_IF_MAYBE(d, parseHexDigit(in[i*2])) {
-      b = *d;
-    } else {
-      return false;
-    }
-    KJ_IF_MAYBE(d, parseHexDigit(in[i*2+1])) {
-      b |= *d << 4;
-    } else {
-      return false;
-    }
-    bytes[i] = b;
-  }
-
-  return true;
-}
+static const uint32_t MAX_DEFINED_APIVERSION = 0;
+// The maximum API version that has been defined, as of this source code's compilation.  We should
+// outright refuse to pack an app claiming compatibility with a newer API version than this, because
+// we can't possibly know what the constraints are on that API.
 
 // =======================================================================================
-// JSON handlers for AppId and PackageId, converting them to their standard textual form.
-
-class AppIdJsonHandler: public capnp::JsonCodec::Handler<spk::AppId> {
-public:
-  void encode(const capnp::JsonCodec& codec, spk::AppId::Reader input,
-              capnp::JsonValue::Builder output) const override {
-    output.setString(appIdString(input));
-  }
-
-  void decode(const capnp::JsonCodec& codec, capnp::JsonValue::Reader input,
-              spk::AppId::Builder output) const override {
-    KJ_UNIMPLEMENTED("AppIdJsonHandler::decode");
-  }
-};
-
-class PackageIdJsonHandler: public capnp::JsonCodec::Handler<spk::PackageId> {
-public:
-  void encode(const capnp::JsonCodec& codec, spk::PackageId::Reader input,
-              capnp::JsonValue::Builder output) const override {
-    output.setString(packageIdString(input));
-  }
-
-  void decode(const capnp::JsonCodec& codec, capnp::JsonValue::Reader input,
-              spk::PackageId::Builder output) const override {
-    KJ_UNIMPLEMENTED("PackageIdJsonHandler::decode");
-  }
-};
+// JSON handlers for very large data or text blobs, which we don't want to print along with
+// `spk verify`. Also base64's data blobs (if they are small enough).
 
 class OversizeDataHandler: public capnp::JsonCodec::Handler<capnp::Data> {
 public:
@@ -276,7 +87,7 @@ public:
     } else {
       auto call = output.initCall();
       call.setFunction("Base64");
-      call.initParams(1)[0].setString(base64Encode(input, false));
+      call.initParams(1)[0].setString(kj::encodeBase64(input, false));
     }
   }
 
@@ -345,66 +156,6 @@ private:
   bool committed = false;
 };
 
-size_t getFileSize(int fd, kj::StringPtr filename) {
-  struct stat stats;
-  KJ_SYSCALL(fstat(fd, &stats));
-  KJ_REQUIRE(S_ISREG(stats.st_mode), "Not a regular file.", filename);
-  return stats.st_size;
-}
-
-class MemoryMapping {
-public:
-  MemoryMapping(): content(nullptr) {}
-
-  explicit MemoryMapping(int fd, kj::StringPtr filename): content(nullptr) {
-    size_t size = getFileSize(fd, filename);
-
-    if (size != 0) {
-      void* ptr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-      if (ptr == MAP_FAILED) {
-        KJ_FAIL_SYSCALL("mmap", errno, filename);
-      }
-
-      content = kj::arrayPtr(reinterpret_cast<byte*>(ptr), size);
-    }
-  }
-
-  ~MemoryMapping() {
-    if (content != nullptr) {
-      KJ_SYSCALL(munmap(content.begin(), content.size()));
-    }
-  }
-
-  KJ_DISALLOW_COPY(MemoryMapping);
-  inline MemoryMapping(MemoryMapping&& other): content(other.content) {
-    other.content = nullptr;
-  }
-  inline MemoryMapping& operator=(MemoryMapping&& other) {
-    MemoryMapping old(kj::mv(*this));
-    content = other.content;
-    other.content = nullptr;
-    return *this;
-  }
-
-  inline operator kj::ArrayPtr<const byte>() const {
-    return content;
-  }
-
-  inline operator capnp::Data::Reader() const {
-    return content;
-  }
-
-  inline operator kj::ArrayPtr<const capnp::word>() const {
-    return kj::arrayPtr(reinterpret_cast<const capnp::word*>(content.begin()),
-                        content.size() / sizeof(capnp::word));
-  }
-
-  inline size_t size() const { return content.size(); }
-
-private:
-  kj::ArrayPtr<byte> content;
-};
-
 class SpkTool: public AbstractMain {
   // Main class for the Sandstorm spk tool.
 
@@ -417,6 +168,8 @@ public:
     exePath = kj::heapString(buf, n);
     if (exePath.endsWith("/sandstorm")) {
       installHome = kj::heapString(buf, n - strlen("/sandstorm"));
+    } else if (exePath.endsWith("/bin/spk")) {
+      installHome = kj::heapString(buf, n - strlen("/bin/spk"));
     }
   }
 
@@ -562,6 +315,26 @@ private:
                          "`appMarketingVersion = (defaultText = \"0.0.0\")`.");
         }
 
+        if (manifest.getMinApiVersion() > MAX_DEFINED_APIVERSION) {
+          return kj::str("The minimum API version this app claims it can run on is ",
+                         manifest.getMinApiVersion(), ", but the maximum API version "
+                         "known to this version of spk is ", MAX_DEFINED_APIVERSION, ".\n"
+                         "Please upgrade sandstorm to the latest version to pack this app.");
+        }
+
+        if (manifest.getMaxApiVersion() > MAX_DEFINED_APIVERSION) {
+          return kj::str("The maximum API version this app claims it can run on is ",
+                         manifest.getMaxApiVersion(), ", but the maximum API version known "
+                         "to this version of spk is ", MAX_DEFINED_APIVERSION, ".\n"
+                         "Please upgrade sandstorm to the latest version.");
+        }
+
+        if (manifest.getMinApiVersion() > manifest.getMaxApiVersion()) {
+          return kj::str("Your manifest specifies a maxApiVersion of ", manifest.getMaxApiVersion(),
+                         " which is less than its minApiVersion of ", manifest.getMinApiVersion(),
+                         ".\nPlease correct this.");
+        }
+
         if (manifest.totalSize().wordCount > spk::Manifest::SIZE_LIMIT_IN_WORDS) {
           return kj::str(
               "Your app metadata is too large. Metadata must be less than 8MB in total -- "
@@ -598,7 +371,7 @@ private:
     static_assert(crypto_sign_PUBLICKEYBYTES == 32, "Signing algorithm changed?");
     KJ_REQUIRE(publicKey.size() == crypto_sign_PUBLICKEYBYTES);
 
-    printAppId(base32Encode(publicKey));
+    printAppId(appIdString(publicKey));
   }
 
   kj::MainBuilder::Validity setKeyringPath(kj::StringPtr arg) {
@@ -636,7 +409,19 @@ private:
     return raiiOpen(filename, flags, 0600);
   }
 
-  spk::KeyFile::Reader lookupKey(kj::StringPtr appid) {
+  spk::KeyFile::Reader lookupKey(kj::StringPtr appid, bool withReplacements = true) {
+    // We actually want to sign packages using the current replacement key for the app ID.
+    byte appidBytes[APP_ID_BYTE_SIZE];
+    KJ_REQUIRE(tryParseAppId(appid, appidBytes), "invalid appid", appid);
+    auto replacement = appIdString(getPublicKeyForApp(appidBytes));
+    if (withReplacements) {
+      appid = replacement;
+    } else {
+      if (appid != replacement) {
+        KJ_LOG(WARNING, "the requested key is obsolete", appid, replacement);
+      }
+    }
+
     if (keyringMapping == nullptr) {
       auto mapping = kj::heap<MemoryMapping>(openKeyring(O_RDONLY), "(keyring)");
       kj::ArrayPtr<const capnp::word> words = *mapping;
@@ -646,7 +431,7 @@ private:
         auto reader = kj::heap<capnp::FlatArrayMessageReader>(words);
         auto key = reader->getRoot<spk::KeyFile>();
         words = kj::arrayPtr(reader->getEnd(), words.end());
-        keyMap.insert(std::make_pair(base32Encode(key.getPublicKey()), kj::mv(reader)));
+        keyMap.insert(std::make_pair(appIdString(key.getPublicKey()), kj::mv(reader)));
       }
     }
 
@@ -687,7 +472,7 @@ private:
 
     capnp::writeMessageToFd(openKeyring(O_WRONLY | O_APPEND | O_CREAT), message);
 
-    return base32Encode(builder.getPublicKey());
+    return appIdString(builder.getPublicKey());
   }
 
   kj::MainBuilder::Validity doKeygen() {
@@ -736,7 +521,7 @@ private:
              "really intended to write it to your terminal. :)";
     }
 
-    auto key = lookupKey(appid);
+    auto key = lookupKey(appid, false);  // Don't get a replacement; get the original.
     capnp::MallocMessageBuilder builder(key.totalSize().wordCount + 4);
     builder.setRoot(key);
     capnp::writeMessageToFd(STDOUT_FILENO, builder);
@@ -942,18 +727,111 @@ private:
         "\n"
         "    actions = [\n"
         "      # Define your \"new document\" handlers here.\n"
-        "      ( title = (defaultText = \"New Instance\"),\n"
+        "      ( nounPhrase = (defaultText = \"instance\"),\n"
         "        command = .myCommand\n"
         "        # The command to run when starting for the first time. (\".myCommand\"\n"
         "        # is just a constant defined at the bottom of the file.)\n"
         "      )\n"
         "    ],\n"
         "\n"
-        "    continueCommand = .myCommand\n"
+        "    continueCommand = .myCommand,\n"
         "    # This is the command called to start your app back up after it has been\n"
         "    # shut down for inactivity. Here we're using the same command as for\n"
         "    # starting a new instance, but you could use different commands for each\n"
         "    # case.\n"
+        "\n"
+        "    metadata = (\n"
+        "      # Data which is not needed specifically to execute the app, but is useful\n"
+        "      # for purposes like marketing and display.  These fields are documented at\n"
+        "      # https://docs.sandstorm.io/en/latest/developing/publishing-apps/#add-required-metadata\n"
+        "      # and (in deeper detail) in the sandstorm source code, in the Metadata section of\n"
+        "      # https://github.com/sandstorm-io/sandstorm/blob/master/src/sandstorm/package.capnp\n"
+        "      icons = (\n"
+        "        # Various icons to represent the app in various contexts.\n"
+        "        #appGrid = (svg = embed \"path/to/appgrid-128x128.svg\"),\n"
+        "        #grain = (svg = embed \"path/to/grain-24x24.svg\"),\n"
+        "        #market = (svg = embed \"path/to/market-150x150.svg\"),\n"
+        "        #marketBig = (svg = embed \"path/to/market-big-300x300.svg\"),\n"
+        "      ),\n"
+        "\n"
+        "      website = \"http://example.com\",\n"
+        "      # This should be the app's main website url.\n"
+        "\n"
+        "      codeUrl = \"http://example.com\",\n"
+        "      # URL of the app's source code repository, e.g. a GitHub URL.\n"
+        "      # Required if you specify a license requiring redistributing code, but optional otherwise.\n"
+        "\n"
+        "      license = (none = void),\n"
+        "      # The license this package is distributed under.  See\n"
+        "      # https://docs.sandstorm.io/en/latest/developing/publishing-apps/#license\n"
+        "\n"
+        "      categories = [],\n"
+        "      # A list of categories/genres to which this app belongs, sorted with best fit first.\n"
+        "      # See the list of categories at\n"
+        "      # https://docs.sandstorm.io/en/latest/developing/publishing-apps/#categories\n"
+        "\n"
+        "      author = (\n"
+        "        # Fields relating to the author of this app.\n"
+        "\n"
+        "        contactEmail = \"youremail@example.com\",\n"
+        "        # Email address to contact for any issues with this app. This includes end-user support\n"
+        "        # requests as well as app store administrator requests, so it is very important that this be a\n"
+        "        # valid address with someone paying attention to it.\n"
+        "\n"
+        "        #pgpSignature = embed \"path/to/pgp-signature\",\n"
+        "        # PGP signature attesting responsibility for the app ID. This is a binary-format detached\n"
+        "        # signature of the following ASCII message (not including the quotes, no newlines, and\n"
+        "        # replacing <app-id> with the standard base-32 text format of the app's ID):\n"
+        "        #\n"
+        "        # \"I am the author of the Sandstorm.io app with the following ID: <app-id>\"\n"
+        "        #\n"
+        "        # You can create a signature file using `gpg` like so:\n"
+        "        #\n"
+        "        #     echo -n \"I am the author of the Sandstorm.io app with the following ID: <app-id>\" | gpg --sign > pgp-signature\n"
+        "        #\n"
+        "        # Further details including how to set up GPG and how to use keybase.io can be found\n"
+        "        # at https://docs.sandstorm.io/en/latest/developing/publishing-apps/#verify-your-identity\n"
+        "\n"
+        "        upstreamAuthor = \"Example App Team\",\n"
+        "        # Name of the original primary author of this app, if it is different from the person who\n"
+        "        # produced the Sandstorm package. Setting this implies that the author connected to the PGP\n"
+        "        # signature only \"packaged\" the app for Sandstorm, rather than developing the app.\n"
+        "        # Remove this line if you consider yourself as the author of the app.\n"
+        "      ),\n"
+        "\n"
+        "      #pgpKeyring = embed \"path/to/pgp-keyring\",\n"
+        "      # A keyring in GPG keyring format containing all public keys needed to verify PGP signatures in\n"
+        "      # this manifest (as of this writing, there is only one: `author.pgpSignature`).\n"
+        "      #\n"
+        "      # To generate a keyring containing just your public key, do:\n"
+        "      #\n"
+        "      #     gpg --export <key-id> > keyring\n"
+        "      #\n"
+        "      # Where `<key-id>` is a PGP key ID or email address associated with the key.\n"
+        "\n"
+        "      #description = (defaultText = embed \"path/to/description.md\"),\n"
+        "      # The app's description in Github-flavored Markdown format, to be displayed e.g.\n"
+        "      # in an app store. Note that the Markdown is not permitted to contain HTML nor image tags (but\n"
+        "      # you can include a list of screenshots separately).\n"
+        "\n"
+        "      shortDescription = (defaultText = \"one-to-three words\"),\n"
+        "      # A very short (one-to-three words) description of what the app does. For example,\n"
+        "      # \"Document editor\", or \"Notetaking\", or \"Email client\". This will be displayed under the app\n"
+        "      # title in the grid view in the app market.\n"
+        "\n"
+        "      screenshots = [\n"
+        "        # Screenshots to use for marketing purposes.  Examples below.\n"
+        "        # Sizes are given in device-independent pixels, so if you took these\n"
+        "        # screenshots on a Retina-style high DPI screen, divide each dimension by two.\n"
+        "\n"
+        "        #(width = 746, height = 795, jpeg = embed \"path/to/screenshot-1.jpeg\"),\n"
+        "        #(width = 640, height = 480, png = embed \"path/to/screenshot-2.png\"),\n"
+        "      ],\n"
+        "      #changeLog = (defaultText = embed \"path/to/sandstorm-specific/changelog.md\"),\n"
+        "      # Documents the history of changes in Github-flavored markdown format (with the same restrictions\n"
+        "      # as govern `description`). We recommend formatting this with an H1 heading for each version\n"
+        "      # followed by a bullet list of changes.\n"
+        "    ),\n"
         "  ),\n"
         "\n"
         "  sourceMap = (\n",
@@ -969,7 +847,7 @@ private:
         "  ),\n"
         "\n",
         includeAllForInit
-        ? "  alwaysInclude = [ \".\" ]\n"
+        ? "  alwaysInclude = [ \".\" ],\n"
           "  # This says that we always want to include all files from the source map.\n"
           "  # (An alternative is to automatically detect dependencies by watching what\n"
           "  # the app opens while running in dev mode. To see what that looks like,\n"
@@ -978,12 +856,81 @@ private:
           "  # `spk dev` will write a list of all the files your app uses to this file.\n"
           "  # You should review it later, before shipping your app.\n"
           "\n"
-          "  alwaysInclude = []\n"
+          "  alwaysInclude = [],\n"
           "  # Fill this list with more names of files or directories that should be\n"
           "  # included in your package, even if not listed in sandstorm-files.list.\n"
           "  # Use this to force-include stuff that you know you need but which may\n"
           "  # not have been detected as a dependency during `spk dev`. If you list\n"
           "  # a directory here, its entire contents will be included recursively.\n",
+          "\n"
+          "  #bridgeConfig = (\n"
+          "  #  # Used for integrating permissions and roles into the Sandstorm shell\n"
+          "  #  # and for sandstorm-http-bridge to pass to your app.\n"
+          "  #  # Uncomment this block and adjust the permissions and roles to make\n"
+          "  #  # sense for your app.\n"
+          "  #  # For more information, see high-level documentation at\n"
+          "  #  # https://docs.sandstorm.io/en/latest/developing/auth/\n"
+          "  #  # and advanced details in the \"BridgeConfig\" section of\n"
+          "  #  # https://github.com/sandstorm-io/sandstorm/blob/master/src/sandstorm/package.capnp\n"
+          "  #  viewInfo = (\n"
+          "  #    # For details on the viewInfo field, consult \"ViewInfo\" in\n"
+          "  #    # https://github.com/sandstorm-io/sandstorm/blob/master/src/sandstorm/grain.capnp\n"
+          "  #\n"
+          "  #    permissions = [\n"
+          "  #    # Permissions which a user may or may not possess.  A user's current\n"
+          "  #    # permissions are passed to the app as a comma-separated list of `name`\n"
+          "  #    # fields in the X-Sandstorm-Permissions header with each request.\n"
+          "  #    #\n"
+          "  #    # IMPORTANT: only ever append to this list!  Reordering or removing fields\n"
+          "  #    # will change behavior and permissions for existing grains!  To deprecate a\n"
+          "  #    # permission, or for more information, see \"PermissionDef\" in\n"
+          "  #    # https://github.com/sandstorm-io/sandstorm/blob/master/src/sandstorm/grain.capnp\n"
+          "  #      (\n"
+          "  #        name = \"editor\",\n"
+          "  #        # Name of the permission, used as an identifier for the permission in cases where string\n"
+          "  #        # names are preferred.  Used in sandstorm-http-bridge's X-Sandstorm-Permissions HTTP header.\n"
+          "  #\n"
+          "  #        title = (defaultText = \"editor\"),\n"
+          "  #        # Display name of the permission, e.g. to display in a checklist of permissions\n"
+          "  #        # that may be assigned when sharing.\n"
+          "  #\n"
+          "  #        description = (defaultText = \"grants ability to modify data\"),\n"
+          "  #        # Prose describing what this role means, suitable for a tool tip or similar help text.\n"
+          "  #      ),\n"
+          "  #    ],\n"
+          "  #    roles = [\n"
+          "  #      # Roles are logical collections of permissions.  For instance, your app may have\n"
+          "  #      # a \"viewer\" role and an \"editor\" role\n"
+          "  #      (\n"
+          "  #        title = (defaultText = \"editor\"),\n"
+          "  #        # Name of the role.  Shown in the Sandstorm UI to indicate which users have which roles.\n"
+          "  #\n"
+          "  #        permissions  = [true],\n"
+          "  #        # An array indicating which permissions this role carries.\n"
+          "  #        # It should be the same length as the permissions array in\n"
+          "  #        # viewInfo, and the order of the lists must match.\n"
+          "  #\n"
+          "  #        verbPhrase = (defaultText = \"can make changes to the document\"),\n"
+          "  #        # Brief explanatory text to show in the sharing UI indicating\n"
+          "  #        # what a user assigned this role will be able to do with the grain.\n"
+          "  #\n"
+          "  #        description = (defaultText = \"editors may view all site data and change settings.\"),\n"
+          "  #        # Prose describing what this role means, suitable for a tool tip or similar help text.\n"
+          "  #      ),\n"
+          "  #      (\n"
+          "  #        title = (defaultText = \"viewer\"),\n"
+          "  #        permissions  = [false],\n"
+          "  #        verbPhrase = (defaultText = \"can view the document\"),\n"
+          "  #        description = (defaultText = \"viewers may view what other users have written.\"),\n"
+          "  #      ),\n"
+          "  #    ],\n"
+          "  #  ),\n"
+          "  #  #apiPath = \"/api\",\n"
+          "  #  # Apps can export an API to the world.  The API is to be used primarily by Javascript\n"
+          "  #  # code and native apps, so it can't serve out regular HTML to browsers.  If a request\n"
+          "  #  # comes in to your app's API, sandstorm-http-bridge will prefix the request's path with\n"
+          "  #  # this string, if specified.\n"
+          "  #),\n"
         ");\n"
         "\n"
         "const myCommand :Spk.Manifest.Command = (\n"
@@ -991,7 +938,11 @@ private:
         "  argv = [", argv, "],\n"
         "  environ = [\n"
         "    # Note that this defines the *entire* environment seen by your app.\n"
-        "    (key = \"PATH\", value = \"/usr/local/bin:/usr/bin:/bin\")\n"
+        "    (key = \"PATH\", value = \"/usr/local/bin:/usr/bin:/bin\"),\n"
+        "    (key = \"SANDSTORM\", value = \"1\"),\n"
+        "    # Export SANDSTORM=1 into the environment, so that apps running within Sandstorm\n"
+        "    # can detect if $SANDSTORM=\"1\" at runtime, switching UI and/or backend to use\n"
+        "    # the app's Sandstorm-specific integration code.\n"
         "  ]\n"
         ");\n");
 
@@ -1199,7 +1150,6 @@ private:
           mapping = MemoryMapping(kj::mv(fd), target);
           auto content = orphanage.referenceExternalData(mapping);
           if (stats.st_mode & S_IXUSR) {
-            warnIfMongod(context);
             builder.adoptExecutable(kj::mv(content));
           } else {
             builder.adoptRegular(kj::mv(content));
@@ -1208,7 +1158,6 @@ private:
           // Small file; direct read preferable.
           ::capnp::Data::Builder buf = nullptr;
           if (stats.st_mode & S_IXUSR) {
-            warnIfMongod(context);
             buf = builder.initExecutable(size);
           } else {
             buf = builder.initRegular(size);
@@ -1248,24 +1197,6 @@ private:
     }
 
   private:
-    void warnIfMongod(kj::ProcessContext& context) {
-      if (target.endsWith("/mongod") || target == "mongod") {
-        context.warning(
-          "** WARNING: It looks like your app uses MongoDB. PLEASE verify that the size\n"
-          "**   of a typical instance of your app is reasonable before you distribute\n"
-          "**   it. App instance storage is found in:\n"
-          "**     $SANDSORM_HOME/var/sandstorm/grains/$GRAIN_ID\n"
-          "**   Mongo likes to pre-allocate lots of space, while Sandstorm grains\n"
-          "**   should be small, which can lead to waste. Please consider using\n"
-          "**   Kenton's fork of Mongo that preallocates less data, found here:\n"
-          "**     https://github.com/kentonv/mongo/tree/niscu\n"
-          "**   This warning will disappear if the name of the binary on your disk is\n"
-          "**   something other than \"mongod\" -- you can still map it to the name\n"
-          "**   \"mongod\" inside your package, e.g. with a mapping like:\n"
-          "**     (packagePath=\"usr/bin/mongod\", sourcePath=\"niscud\")");
-      }
-    }
-
     kj::String target;
     // The disk path which should be used to initialize this node.
 
@@ -1372,14 +1303,16 @@ private:
       }
     }
 
-    node.setTarget(kj::mv(mapping.sourcePaths[0]));
+    if (mapping.sourcePaths.size() > 0) {
+      node.setTarget(kj::mv(mapping.sourcePaths[0]));
+    }
   }
 
   kj::String getHttpBridgeExe() {
-    KJ_IF_MAYBE(slashPos, exePath.findLast('/')) {
-      return kj::str(exePath.slice(0, *slashPos), "/bin/sandstorm-http-bridge");
+    KJ_IF_MAYBE(h, installHome) {
+      return kj::str(*h, "/bin/sandstorm-http-bridge");
     } else {
-      return kj::heapString("/bin/sandstorm-http-bridge");
+      KJ_FAIL_ASSERT("don't know where to find sandstorm-http-bridge");
     }
   }
 
@@ -1457,6 +1390,8 @@ private:
 
   friend kj::String unpackSpk(int spkfd, kj::StringPtr outdir, kj::StringPtr tmpdir);
   friend void verifySpk(int spkfd, int tmpfile, spk::VerifiedInfo::Builder output);
+  friend kj::Maybe<kj::String> checkPgpSignature(
+      kj::StringPtr appIdString, spk::Metadata::Reader metadata, kj::Maybe<uid_t> sandboxUid);
 
   static kj::String verifyImpl(
       int spkfd, int tmpfile, kj::Maybe<spk::VerifiedInfo::Builder> maybeInfo,
@@ -1464,10 +1399,32 @@ private:
     // Read package form spkfd, check the validity and signature, and return the appId. Also write
     // the uncompressed archive to `tmpfile`.
 
+    // We need to compute the hash of the input. The input could be a pipe (not a file), therefore
+    // we need to read it in chunks, hash the content, and write back out to the pipe that xz will
+    // use as input below. We'll do all that in a thread to keep the code simple.
+    byte packageHash[crypto_hash_sha256_BYTES];
+    Pipe spkPipe = Pipe::make();
+    auto hashThread = new kj::Thread([&]() {
+      crypto_hash_sha256_state packageHashState;
+      KJ_ASSERT(crypto_hash_sha256_init(&packageHashState) == 0);
+
+      byte buffer[8192];
+      kj::FdOutputStream out(kj::mv(spkPipe.writeEnd));
+      for (;;) {
+        ssize_t n;
+        KJ_SYSCALL(n = read(spkfd, buffer, sizeof(buffer)));
+        if (n == 0) break;
+        KJ_ASSERT(crypto_hash_sha256_update(&packageHashState, buffer, n) == 0);
+        out.write(buffer, n);
+      }
+
+      KJ_ASSERT(crypto_hash_sha256_final(&packageHashState, packageHash));
+    });
+
     // Check the magic number.
     auto expectedMagic = spk::MAGIC_NUMBER.get();
     byte magic[expectedMagic.size()];
-    kj::FdInputStream(spkfd).read(magic, expectedMagic.size());
+    kj::FdInputStream(spkPipe.readEnd.get()).read(magic, expectedMagic.size());
     for (uint i: kj::indices(expectedMagic)) {
       if (magic[i] != expectedMagic[i]) {
         return validationError("Does not appear to be an .spk (bad magic number).");
@@ -1478,10 +1435,11 @@ private:
     Pipe pipe = Pipe::make();
 
     Subprocess::Options childOptions({"xz", "-dc"});
-    childOptions.stdin = spkfd;
+    childOptions.stdin = spkPipe.readEnd;
     childOptions.stdout = pipe.writeEnd;
     Subprocess child(kj::mv(childOptions));
 
+    spkPipe.readEnd = nullptr;
     pipe.writeEnd = nullptr;
     kj::FdInputStream in(kj::mv(pipe.readEnd));
 
@@ -1532,6 +1490,11 @@ private:
     }
 
     child.waitForSuccess();
+    hashThread = nullptr;  // joins thread
+
+    // The spk pipe thread should have exited now, completing the hash.
+    static_assert(PACKAGE_ID_BYTE_SIZE <= crypto_hash_sha256_BYTES, "package ID size changed?");
+    auto packageIdBytes = kj::arrayPtr(packageHash, PACKAGE_ID_BYTE_SIZE);
 
     // Check that hashes match.
     byte hash[crypto_hash_sha512_BYTES];
@@ -1540,17 +1503,13 @@ private:
       return validationError("Signature didn't match package contents.");
     }
 
-    auto appIdString = base32Encode(publicKey);
+    // Get the canonical app ID based on the replacements table (see appid-replacements.capnp).
+    // This also throws if the key is revoked.
+    applyAppidReplacements(publicKey, packageIdBytes);
+
+    auto appIdString = sandstorm::appIdString(publicKey);
 
     KJ_IF_MAYBE(info, maybeInfo) {
-      // Compute hash of input package (for package ID).
-      byte hash[crypto_hash_sha256_BYTES];
-      {
-        MemoryMapping spkMapping(spkfd, "(spk file)");
-        kj::ArrayPtr<const byte> bytes = spkMapping;
-        crypto_hash_sha256(hash, bytes.begin(), bytes.size());
-      }
-
       // mmap the temp file.
       MemoryMapping tmpMapping(tmpfile, "(temp file)");
 
@@ -1588,8 +1547,8 @@ private:
           }
           {
             auto packageId = capnp::AnyStruct::Builder(info->initPackageId()).getDataSection();
-            KJ_ASSERT(packageId.size() == sizeof(hash) / 2);
-            memcpy(packageId.begin(), hash, sizeof(hash) / 2);
+            KJ_ASSERT(packageId.size() == packageIdBytes.size());
+            memcpy(packageId.begin(), packageIdBytes.begin(), packageIdBytes.size());
           }
 
           info->setTitle(manifest.getAppTitle());
@@ -1610,11 +1569,7 @@ private:
                   "author's PGP signature is present but no PGP keyring is provided");
             }
 
-            auto expectedContent = kj::str(
-                "I am the author of the Sandstorm.io app with the following ID: ",
-                appIdString);
-
-            info->setAuthorPgpKeyFingerprint(checkPgpSignature(expectedContent,
+            info->setAuthorPgpKeyFingerprint(checkPgpSignature(appIdString,
                 author.getPgpSignature(), metadata.getPgpKeyring(), validationError));
           }
 
@@ -1637,8 +1592,13 @@ private:
   }
 
   static kj::String checkPgpSignature(
-      kj::StringPtr expectedContent, kj::ArrayPtr<const byte> sig, kj::ArrayPtr<const byte> key,
-      kj::Function<kj::String(kj::StringPtr problem)>& validationError) {
+      kj::StringPtr appIdString, kj::ArrayPtr<const byte> sig, kj::ArrayPtr<const byte> key,
+      kj::Function<kj::String(kj::StringPtr problem)>& validationError,
+      kj::Maybe<uid_t> sandboxUid = nullptr) {
+    auto expectedContent = kj::str(
+        "I am the author of the Sandstorm.io app with the following ID: ",
+        appIdString);
+
     char keyfile[] = "/tmp/spk-pgp-key.XXXXXX";
     int keyfd;
     KJ_SYSCALL(keyfd = mkstemp(keyfile));
@@ -1667,6 +1627,7 @@ private:
     Subprocess::Options gpgOptions({
         "gpg", "--homedir", gpghome, "--status-fd", "3", "--no-default-keyring",
         "--keyring", keyfile, "--decrypt", sigfile});
+    gpgOptions.uid = sandboxUid;
     gpgOptions.stdout = outPipe.writeEnd;
     gpgOptions.stderr = messagePipe.writeEnd;
     int moreFds[1] = { statusPipe.writeEnd };
@@ -1718,7 +1679,7 @@ private:
       }
     }
 
-    if (gpg.waitForExit() != 0) {
+    if (gpg.waitForExitOrSignal() != 0) {
       return validationError(kj::str(
           "SPK PGP signature check validation failed. GPG output follows.\n",
           kj::implicitCast<kj::ArrayPtr<const char>>(message)));
@@ -1771,6 +1732,13 @@ private:
     kj::ArrayPtr<const capnp::word> tmpWords = tmpMapping;
     capnp::ReaderOptions options;
     options.traversalLimitInWords = tmpWords.size();
+
+    // We've observed that apps which use npm can have insanely deep directory trees due to npm's
+    // insane approach to dependency management. We've seen at least one app creep over the default
+    // nesting limit of 64, so we double it to 128. (We can't just set this to infinity for the
+    // same security reasons this limit exists in the first place.)
+    options.nestingLimit = 128;
+
     capnp::FlatArrayMessageReader archiveMessage(tmpWords, options);
 
     // Unpack.
@@ -1846,14 +1814,18 @@ private:
     return kj::MainBuilder(context, "Sandstorm version " SANDSTORM_VERSION,
             "Check that <spkfile>'s signature is valid. If so, print the app ID to stdout.")
         .addOption({'d', "details"}, KJ_BIND_METHOD(*this, setDetailed),
+            // `spk verify` now prints details by default, but the --details switch is left here for
+            // backwards compatibility for callers.
             "Print detailed metadata extracted from the app manifest. The output is intended to "
-            "be machine-parseable.")
+            "be machine-parseable.  This flag is now enabled by default.")
         .expectArg("<spkfile>", KJ_BIND_METHOD(*this, setUnpackSpkfile))
         .callAfterParsing(KJ_BIND_METHOD(*this, doVerify))
         .build();
   }
 
-  bool detailed = false;
+  bool detailed = true;
+  // Print verbose details by default when verifying, since that's the primary
+  // reason anyone will call the verify subcommand.
 
   bool setDetailed() {
     detailed = true;
@@ -1912,6 +1884,7 @@ private:
   kj::String serverBinary;
   kj::StringPtr mountDir;
   bool fuseCaching = false;
+  bool mountProc = false;
 
   kj::MainFunc getDevMain() {
     return addCommonOptions(OptionSet::ALL_READONLY,
@@ -1933,6 +1906,10 @@ private:
             "Enable aggressive caching over the FUSE filesystem used to detect dependencies. "
             "This may improve performance but means that you will have to restart `spk dev` "
             "any time you make a change to your code.")
+        .addOption({"proc"}, KJ_BIND_METHOD(*this, enableMountProc),
+            "Mount /proc inside the sandbox. This can be useful for debugging. For security "
+            "reasons, this option is only available when you are developing an app; packaged "
+            "apps do not get access to /proc.")
         .callAfterParsing(KJ_BIND_METHOD(*this, doDev)))
         .build();
   }
@@ -1960,6 +1937,11 @@ private:
 
   kj::MainBuilder::Validity enableFuseCaching() {
     fuseCaching = true;
+    return true;
+  }
+
+  kj::MainBuilder::Validity enableMountProc() {
+    mountProc = true;
     return true;
   }
 
@@ -2022,6 +2004,12 @@ private:
       // Write the app ID to the socket.
       {
         auto msg = kj::str(packageDef.getId(), "\n");
+        kj::FdOutputStream((int)clientEnd).write(msg.begin(), msg.size());
+      }
+
+      // Write the mountProc option to the socket.
+      {
+        auto msg = kj::str(mountProc ? "1" : "0", "\n");
         kj::FdOutputStream((int)clientEnd).write(msg.begin(), msg.size());
       }
 
@@ -2112,7 +2100,7 @@ private:
         context.warning("App is now available from Sandstorm server. Ctrl+C to disconnect.");
       }
 
-      bindFuse(eventPort, fuseFd, rootNode, options)
+      bindFuse(eventPort, fuseFd, kj::mv(rootNode), options)
           .then([&]() {
             context.warning("Unmounted cleanly.");
             KJ_IF_MAYBE(m, fuseMount) {
@@ -2174,7 +2162,7 @@ private:
 
       if (!includeAll) {
         context.warning(
-            "Your program used the following files. (If you would specify `fileList` in \n"
+            "Your program used the following files. (If you would specify `fileList` in\n"
             "the package definition, I could write the list there.)\n\n");
         auto msg = kj::str(
             kj::StringTree(KJ_MAP(file, usedFiles) { return kj::strTree(file); }, "\n"), "\n");
@@ -2358,7 +2346,7 @@ private:
                 case appindex::SubmissionState::PUBLISH:
                   context.exitInfo(
                       "Thanks for your submission! A human will look at your submission to make "
-                      "sure that everything is order before it goes live. If we spot any mistakes "
+                      "sure that everything is in order before it goes live. If we spot any mistakes "
                       "we'll let you know, otherwise your app will go live as soon as it has been "
                       "checked. Either way, we'll send you an email at the contact address you "
                       "provided in the metadata. (If you'd like to prevent this submission "
@@ -2457,6 +2445,24 @@ void verifySpk(int spkfd, int tmpfile, spk::VerifiedInfo::Builder output) {
   SpkTool::verifyImpl(spkfd, tmpfile, output, [](kj::StringPtr problem) -> kj::String {
     KJ_FAIL_ASSERT("spk verification failed", problem);
   });
+}
+
+kj::Maybe<kj::String> checkPgpSignature(kj::StringPtr appIdString, spk::Metadata::Reader metadata,
+                                        kj::Maybe<uid_t> sandboxUid) {
+  auto author = metadata.getAuthor();
+
+  if (author.hasPgpSignature()) {
+    KJ_REQUIRE(metadata.hasPgpKeyring(), "package metadata contains PGP signature but no keyring");
+
+    kj::Function<kj::String(kj::StringPtr problem)> error =
+        [](kj::StringPtr problem) -> kj::String {
+      KJ_FAIL_ASSERT("PGP signature verification problem", problem);
+    };
+    return SpkTool::checkPgpSignature(appIdString,
+        author.getPgpSignature(), metadata.getPgpKeyring(), error, sandboxUid);
+  } else {
+    return nullptr;
+  }
 }
 
 }  // namespace sandstorm

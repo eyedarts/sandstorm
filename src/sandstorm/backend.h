@@ -33,9 +33,11 @@ namespace sandstorm {
 class BackendImpl: public Backend::Server, private kj::TaskSet::ErrorHandler {
 public:
   BackendImpl(kj::LowLevelAsyncIoProvider& ioProvider, kj::Network& network,
-              SandstormCoreFactory::Client&& sandstormCoreFactory);
+              SandstormCoreFactory::Client&& sandstormCoreFactory,
+              kj::Maybe<uid_t> sandboxUid);
 
 protected:
+  kj::Promise<void> ping(PingContext context) override;
   kj::Promise<void> startGrain(StartGrainContext context) override;
   kj::Promise<void> getGrain(GetGrainContext context) override;
   kj::Promise<void> deleteGrain(DeleteGrainContext context) override;
@@ -49,11 +51,13 @@ protected:
   kj::Promise<void> uploadBackup(UploadBackupContext context) override;
   kj::Promise<void> downloadBackup(DownloadBackupContext context) override;
   kj::Promise<void> deleteBackup(DeleteBackupContext context) override;
+  kj::Promise<void> getGrainStorageUsage(GetGrainStorageUsageContext context) override;
 
 private:
   kj::LowLevelAsyncIoProvider& ioProvider;
   kj::Network& network;
   SandstormCoreFactory::Client coreFactory;
+  kj::Maybe<uid_t> sandboxUid;   // if not using user namespaces
   kj::TaskSet tasks;
 
   class RunningGrain {
@@ -88,7 +92,8 @@ private:
   class FileUploadStream;
 
   kj::Promise<Supervisor::Client> bootGrain(kj::StringPtr grainId, kj::StringPtr packageId,
-      spk::Manifest::Command::Reader command, bool isNew, bool devMode, bool isRetry);
+      spk::Manifest::Command::Reader command, bool isNew, bool devMode, bool mountProce,
+      bool isRetry);
 
   static kj::Promise<void> ignoreAll(kj::AsyncInputStream& input);
   static kj::Promise<kj::String> readAll(kj::AsyncInputStream& input,

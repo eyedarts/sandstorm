@@ -31,8 +31,14 @@ interface Backend {
 
   const socketPath :Text = "/var/sandstorm/socket/backend";
 
+  ping @14 ();
+  # Just returns. Used to verify that the connection to the back-end is alive and well.
+
+  # ----------------------------------------------------------------------------
+
   startGrain @0 (ownerId :Text, grainId :Text, packageId :Text,
-                 command :Package.Manifest.Command, isNew :Bool, devMode :Bool = false)
+                 command :Package.Manifest.Command, isNew :Bool,
+                 devMode :Bool = false, mountProc :Bool = false)
              -> (supervisor :Supervisor);
   # Start a grain.
 
@@ -52,10 +58,14 @@ interface Backend {
 
   installPackage @3 () -> (stream :PackageUploadStream);
   interface PackageUploadStream extends(Util.ByteStream) {
-    saveAs @0 (packageId :Text) -> (appId :Text, manifest :Package.Manifest);
+    saveAs @0 (packageId :Text) -> (appId :Text, manifest :Package.Manifest,
+                                    authorPgpKeyFingerprint :Text);
+    # `authorPgpKeyFingerprint` is present only if the signature is valid, and is null if there
+    # is no signature. (Invalid signature throws exception.)
   }
 
-  tryGetPackage @4 (packageId :Text) -> (appId :Text, manifest :Package.Manifest);
+  tryGetPackage @4 (packageId :Text) -> (appId :Text, manifest :Package.Manifest,
+                                         authorPgpKeyFingerprint :Text);
   # Get info from an already-installed package. Return values are null if the package doesn't
   # exist.
 
@@ -79,7 +89,7 @@ interface Backend {
   # Download a stored backup, writing it to `stream`.
 
   deleteBackup @10 (backupId :Text);
-  # Delete a stored backup form disk. Succeeds silently if the backup doesn't exist.
+  # Delete a stored backup from disk. Succeeds silently if the backup doesn't exist.
 
   # ----------------------------------------------------------------------------
 
@@ -88,6 +98,12 @@ interface Backend {
   #
   # This method is not implemented by the single-machine version of Sandstorm, which does not track
   # per-user storage quotas.
+
+  getGrainStorageUsage @15 (ownerId :Text, grainId :Text) -> (size :UInt64);
+  # Returns the number of bytes of data in storage attributed to the given grain.
+  #
+  # On single-machine Sandstorm, this walks the directory tree, which may be slow. Therefore,
+  # it is recommended that this not be called often.
 }
 
 interface SandstormCoreFactory {

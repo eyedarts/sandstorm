@@ -1,19 +1,20 @@
-Title: Auto-install with root on Debian jessie, in dev mode
+Title: Ensure that installing with defaults succeeds (here we run it as root)
 Vagrant-Box: jessie
-Vagrant-Precondition-bash: ! -d $HOME/sandstorm
-Vagrant-Precondition-bash: ! -d /opt/sandstorm
-Cleanup: uninstall_sandstorm(parsed_headers['vagrant-box'])
+Precondition: sandstorm_not_installed
+Cleanup: uninstall_sandstorm
 
 $[run]sudo cat /proc/sys/kernel/unprivileged_userns_clone
 $[slow]0
-$[run]sudo CURL_USER_AGENT=testing bash /vagrant/install.sh -d
+$[run]sudo CURL_USER_AGENT=testing REPORT=no bash /vagrant/install.sh -d
 $[slow]Sandstorm requires sysctl kernel.unprivileged_userns_clone to be enabled.
-Config written to /opt/sandstorm/sandstorm.conf.
-Finding latest build for dev channel...
+$[slow]Config written to /opt/sandstorm/sandstorm.conf.
+$[slow]Finding latest build for dev channel...
 $[veryslow]Downloading: https://dl.sandstorm.io/
+$[veryslow]GPG signature is valid.
 $[veryslow]Sandstorm started.
-Setup complete. You should configure the site at:
-  http://local.sandstorm.io:6080/admin/
+$[veryslow]Your server is coming online. Waiting up to 90 seconds...
+$[veryslow]Visit this link to start using it:
+  http://local.sandstorm.io:6080/
 To learn how to control the server, run:
   sandstorm help
 $[exitcode]0

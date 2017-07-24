@@ -61,6 +61,14 @@ the user's back.
 Sandstorm aims to prevent apps from engaging in covert surveillance
 while allowing statistics gathering when the user consents to it.
 
+## Case Studies
+
+By our analysis, Sandstorm automatically protected users from over 95% of the publicly disclosed
+security vulnerabilities discovered in apps on the Sandstorm app market, before the vulnerabilities
+were even disclosed. We also mitigated most Linux kernel security issues. See [Security
+non-events](security-non-events) for examples of security problems which were mitigated by
+Sandstorm.
+
 ## Strategies
 
 Sandstorm's primary overarching security strategies are as follows.
@@ -133,17 +141,17 @@ channel by leaking plain bits -- in technical terms, _capabilities_ in
 Sandstorm are never just bits, and therefore you cannot leak
 _capabilities_ via covert channels.
 
-_**Alpha Notice:** As of this writing (May 2015), Sandstorm is in
-alpha. Key features allowing a user to easily grant an application
+_**Beta Notice:** As of this writing (April 2016), Sandstorm is in
+beta. Key features allowing a user to easily grant an application
 access to external resources are still in development. In order to
-make Sandstorm more useful to alpha testers and early adopters, we
-have temporarily opened some intentional holes in our confinement
-model. For example, we have allowed outgoing HTTP to arbitrary servers
-in order to permit the TinyTiny RSS app to fetch RSS feeds, and we
-have allowed incoming and outgoing SMTP (with certain restrictions) to
-allow email clients to work. These holes will be closed as soon as the
-Powerbox UI and drivers make them obsolete, but in the meantime
-Sandstorm does not yet implement true confinement._
+make Sandstorm more useful to early adopters, we have temporarily
+opened some intentional holes in our confinement model. For example,
+we have allowed outgoing HTTP to arbitrary servers in order to permit
+the TinyTiny RSS app to fetch RSS feeds, and we have allowed incoming
+and outgoing SMTP (with certain restrictions) to allow email clients
+to work. These holes will be closed as soon as the Powerbox UI and
+drivers make them obsolete, but in the meantime Sandstorm does not yet
+implement true confinement._
 
 ### Capability-based Usable Security
 
@@ -159,7 +167,7 @@ Since Sandstorm isolates and confines apps by default, we need a way
 to allow the user to connect apps to each other easily and
 securely. Capability-based security helps enable this by representing
 permissions as "capabilities", objects which the user may pass around
-between apps. A capbility both identifies a resource (like an address)
+between apps. A capability both identifies a resource (like an address)
 and grants its bearer permission to _use_ that resource.
 
 The advantage of capability-based security is that it effectively
@@ -303,46 +311,3 @@ permission, in order to implement full confinement. As of this writing
 (May 2015), this has not yet been put in place, mostly because
 server-side confinement is not complete (as described earlier) which
 makes client-side confinement largely moot for the moment.
-
-## Case Studies
-
-We've already seen Sandstorm's security model mitigate bugs in apps. Here are some examples.
-
-### Etherpad
-
-Etherpad has, over the last several months, disclosed several vulnerabilities falling into a few categories:
-
-* Path injection attacks allowing anyone to download arbitrary files
-  from the server's filesystem (such as Etherpad's own database,
-  containing credentials).
-
-* Information leaks allowing someone with access to one document on
-  the server to discover and read other documents.
-
-* Various other minor information leaks of user and system
-  information.
-
-None of these problems have affected Etherpad on Sandstorm, because
-Sandstorm runs every Etherpad document in a separate container, and
-because Sandstorm implements authentication, sharing, and access
-control.
-
-### Wordpress
-
-The Sandstorm port of Wordpress separates the Wordpress admin
-interface from the publicly-facing published web site. The admin
-interface is accessed through Sandstorm, whereas the published site is
-served as read-only content. The Wordpress may not even be running
-when public content is served; Sandstorm simply returns the content
-from disk.
-
-As a result, many recent Wordpress security vulnerabilities are
-mitigated by Sandstorm: since regular visitors to the site have no
-ability to interact with Wordpress software, they have no ability to
-exploit it. Several recent Wordpress security vulnerabilities are
-therefore irrelevant to Sandstorm users.
-
-(Admittedly, this protection currently comes at the cost of disabling
-features like public comments. We plan to address this in the
-future. For many use cases, though, this restriction is perfectly
-acceptable.)

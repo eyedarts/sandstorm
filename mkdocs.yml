@@ -1,6 +1,12 @@
-site_name: Sandstorm
+site_name: Docs
+theme_dir: 'docs/sandstorm_readthedocs_modified_theme'
 theme: 'readthedocs'
-repo_url: https://github.com/sandstorm-io/sandstorm/tree/master/docs
+repo_url: https://github.com/sandstorm-io/sandstorm
+edit_uri: edit/master/docs/
+markdown_extensions:
+    - inline_graphviz
+extra_css:
+    - "extra.css"
 pages:
 - "Home": "index.md"
 - Using:
@@ -9,20 +15,24 @@ pages:
     - "Top bar": "using/top-bar.md"
     - "How it works": "using/how-it-works.md"
     - "Security practices": "using/security-practices.md"
+    - "Security non-events": "using/security-non-events.md"
 - Developing apps:
-    - "Overview": "developing.md"
-    - "Overview of vagrant-spk": "vagrant-spk/index.md"
-    - "Installation": "vagrant-spk/installation.md"
+    - "Developer hub": "developing.md"
+    - "Installing vagrant-spk for package dev": "vagrant-spk/installation.md"
     - "Packaging tutorial": "vagrant-spk/packaging-tutorial.md"
-    - "App publishing guide": "developing/publishing-apps.md"
-    - "App Developer Handbook": "developing/handbook.md"
+    - "Packaging tutorial (Meteor)": "vagrant-spk/packaging-tutorial-meteor.md"
+    - "App market publishing guide": "developing/publishing-apps.md"
+    - "App developer handbook": "developing/handbook.md"
     - "User authentication & permissions": "developing/auth.md"
-    - "Understanding & customizing": "vagrant-spk/customizing.md"
+    - "URLs, domain names, page titles": "developing/path.md"
+    - "Understanding & customizing vagrant-spk": "vagrant-spk/customizing.md"
     - "Platform stacks": "vagrant-spk/platform-stacks.md"
     - "Code dependencies": "vagrant-spk/code-dependencies.md"
     - "Service dependencies": "vagrant-spk/services.md"
+    - "Debugging a running grain": "developing/debugging.md"
     - "Web publishing": "developing/web-publishing.md"
     - "Exporting HTTP APIs": "developing/http-apis.md"
+    - "Connecting grains to each other & Sandstorm via powerbox": "developing/powerbox.md"
     - "Email from apps": "developing/email-from-apps.md"
     - "vagrant-spk design document": "vagrant-spk/design.md"
     - "Troubleshooting": "developing/troubleshooting.md"
@@ -33,12 +43,21 @@ pages:
     - "Raw integration of pure client apps": "developing/raw-pure-client-apps.md"
 - Administering:
     - "Overview": "administering.md"
-    - "Installation": "install.md"
+    - "Installation & uninstall": "install.md"
+    - "Troubleshooting a new install": "administering/install-troubleshooting.md"
+    - "Reference docs for install.sh": "administering/install-script.md"
+    - "Reference docs for sandstorm.conf": "administering/config-file.md"
+    - "Administrator's guide": "administering/guide.md"
     - "Sandcats dynamic DNS": "administering/sandcats.md"
     - "Email": "administering/email.md"
     - "Demo mode": "administering/demo.md"
     - "Backups": "administering/backups.md"
     - "Wildcard hosts": "administering/wildcard.md"
+    - "HTTPS & SSL": "administering/ssl.md"
+    - "Free sandcats.io HTTPS": "administering/sandcats-https.md"
     - "Reverse Proxy": "administering/reverse-proxy.md"
-    - "Self-Signed SSL": "administering/ssl.md"
+    - "Self-signed SSL": "administering/self-signed.md"
+    - "Organizational Features": "administering/for-work.md"
+    - "Active Directory integration": "administering/active-directory.md"
     - "Frequently asked questions": "administering/faq.md"
+    - "Running a Sandstorm hosting provider": "administering/hosting-provider.md"

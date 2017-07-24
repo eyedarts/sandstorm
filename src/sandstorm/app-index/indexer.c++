@@ -17,7 +17,10 @@
 #include "indexer.h"
 #include <sandstorm/app-index/app-index.capnp.h>
 #include <sandstorm/spk.h>
+#include <sandstorm/id-to-text.h>
+#include <sandstorm/appid-replacements.h>
 #include <capnp/serialize.h>
+#include <kj/encoding.h>
 #include <stdlib.h>
 #include <map>
 #include <sodium/crypto_generichash_blake2b.h>
@@ -25,6 +28,7 @@
 #include <time.h>
 #include <capnp/schema.h>
 #include <capnp/compat/json.h>
+#include <stdio.h>  // rename()
 
 namespace sandstorm {
 namespace appindex {
@@ -72,7 +76,7 @@ void Indexer::addKeybaseProfile(kj::StringPtr fingerprint, capnp::MallocMessageB
   file.finalize(kj::str("/var/keybase/", fingerprint));
 }
 
-bool Indexer::tryGetAppId(kj::StringPtr packageId, byte appId[crypto_sign_PUBLICKEYBYTES]) {
+bool Indexer::tryGetPublicKey(kj::StringPtr packageId, byte publicKey[crypto_sign_PUBLICKEYBYTES]) {
   KJ_REQUIRE(packageId.size() == 32, "invalid package ID", packageId);
   for (auto c: packageId) {
     KJ_REQUIRE(isalnum(c), "invalid package ID", packageId);
@@ -96,7 +100,8 @@ bool Indexer::tryGetAppId(kj::StringPtr packageId, byte appId[crypto_sign_PUBLIC
   auto bytes = capnp::AnyStruct::Reader(
       infoMessage.getRoot<spk::VerifiedInfo>().getAppId()).getDataSection();
   KJ_ASSERT(bytes.size() == crypto_sign_PUBLICKEYBYTES);
-  memcpy(appId, bytes.begin(), bytes.size());
+  static_assert(crypto_sign_PUBLICKEYBYTES == APP_ID_BYTE_SIZE, "app ID size changed?");
+  memcpy(publicKey, sandstorm::getPublicKeyForApp(bytes).begin(), crypto_sign_PUBLICKEYBYTES);
 
   return true;
 }
@@ -180,41 +185,21 @@ void Indexer::getSubmissionStatus(kj::StringPtr packageId, capnp::MessageBuilder
   capnp::readMessageCopyFromFd(raiiOpen(statusFile, O_RDONLY), output);
 }
 
+kj::String Indexer::getAppTitle(kj::StringPtr packageId) {
+  capnp::StreamFdMessageReader message(
+      sandstorm::raiiOpen(kj::str("/var/packages/", packageId, "/metadata"), O_RDONLY));
+  return kj::str(message.getRoot<spk::VerifiedInfo>().getTitle().getDefaultText());
+}
+
 // =======================================================================================
 
 namespace {
-
-class AppIdJsonHandler: public capnp::JsonCodec::Handler<spk::AppId> {
-public:
-  void encode(const capnp::JsonCodec& codec, spk::AppId::Reader input,
-              capnp::JsonValue::Builder output) const override {
-    output.setString(appIdString(input));
-  }
-
-  void decode(const capnp::JsonCodec& codec, capnp::JsonValue::Reader input,
-              spk::AppId::Builder output) const override {
-    KJ_UNIMPLEMENTED("AppIdJsonHandler::decode");
-  }
-};
-
-class PackageIdJsonHandler: public capnp::JsonCodec::Handler<spk::PackageId> {
-public:
-  void encode(const capnp::JsonCodec& codec, spk::PackageId::Reader input,
-              capnp::JsonValue::Builder output) const override {
-    output.setString(packageIdString(input));
-  }
-
-  void decode(const capnp::JsonCodec& codec, capnp::JsonValue::Reader input,
-              spk::PackageId::Builder output) const override {
-    KJ_UNIMPLEMENTED("PackageIdJsonHandler::decode");
-  }
-};
 
 class DataHandler: public capnp::JsonCodec::Handler<capnp::Data> {
 public:
   void encode(const capnp::JsonCodec& codec, capnp::Data::Reader input,
               capnp::JsonValue::Builder output) const override {
-    output.setString(base64Encode(input, false));
+    output.setString(kj::encodeBase64(input, false));
   }
 
   capnp::Orphan<capnp::Data> decode(
@@ -226,7 +211,7 @@ public:
 
 }  // namespace
 
-void Indexer::updateIndex() {
+void Indexer::updateIndexInternal(kj::StringPtr outputDir, bool experimental) {
   capnp::MallocMessageBuilder scratch;
   auto orphanage = scratch.getOrphanage();
 
@@ -248,7 +233,8 @@ void Indexer::updateIndex() {
 
       capnp::StreamFdMessageReader statusMessage(raiiOpen(statusFile, O_RDONLY));
       auto status = statusMessage.getRoot<SubmissionStatus>();
-      if (status.getRequestState() == SubmissionState::PUBLISH && status.isApproved()) {
+      auto include = experimental ? status.isPending() : status.isApproved();
+      if (include && status.getRequestState() == SubmissionState::PUBLISH) {
         capnp::StreamFdMessageReader metadataMessage(raiiOpen(metadataFile, O_RDONLY));
         auto info = metadataMessage.getRoot<spk::VerifiedInfo>();
         auto metadata = info.getMetadata();
@@ -278,6 +264,7 @@ void Indexer::updateIndex() {
           summary.setAppId(info.getAppId());
           summary.setName(info.getTitle().getDefaultText());
           summary.setVersion(info.getMarketingVersion().getDefaultText());
+          summary.setVersionNumber(info.getVersion());
           summary.setPackageId(info.getPackageId());
 
           auto icons = metadata.getIcons();
@@ -346,9 +333,6 @@ void Indexer::updateIndex() {
                     details.setLicense(
                         annotation.getValue().getStruct().getAs<spk::OsiLicenseInfo>().getTitle());
                     break;
-                    // The first person to submit a pull request removing this comment will receive
-                    // a free Sandstorm t-shirt. Yes, really. Sandstorm employees are not eligible,
-                    // but should still mention to Kenton that they saw this.
                   }
                 }
               }
@@ -404,16 +388,32 @@ void Indexer::updateIndex() {
     apps.setWithCaveats(i++, appEntry.second.summary.getReader());
 
     auto text = json.encode(appEntry.second.details.getReader());
-    StagingFile file("/var/www/apps");
+    StagingFile file(outputDir);
     kj::FdOutputStream(file.getFd()).write(text.begin(), text.size());
-    file.finalize(kj::str("/var/www/apps/", appEntry.first, ".json"));
+    file.finalize(kj::str(outputDir, "/", appEntry.first, ".json"));
+
+    if (!experimental) {
+      // Write the symlink under /var/apps.
+      auto target = kj::str("../packages/",
+          packageIdString(appEntry.second.summary.getReader().getPackageId()));
+      auto linkPath = kj::str("/var/apps/", appEntry.first);
+      auto tmpLinkPath = kj::str(linkPath, ".tmp");
+      unlink(tmpLinkPath.cStr());  // just in case
+      KJ_SYSCALL(symlink(target.cStr(), tmpLinkPath.cStr()));
+      KJ_SYSCALL(rename(tmpLinkPath.cStr(), linkPath.cStr()));
+    }
   }
   KJ_ASSERT(i == apps.size());
 
   auto text = json.encode(indexData);
-  StagingFile file("/var/www/apps");
+  StagingFile file(outputDir);
   kj::FdOutputStream(file.getFd()).write(text.begin(), text.size());
-  file.finalize(kj::str("/var/www/apps/index.json"));
+  file.finalize(kj::str(outputDir, "/index.json"));
+}
+
+void Indexer::updateIndex() {
+  updateIndexInternal("/var/www/apps", false);
+  updateIndexInternal("/var/www/experimental", true);
 }
 
 kj::String Indexer::writeIcon(spk::Metadata::Icon::Reader icon) {
@@ -454,7 +454,7 @@ kj::String Indexer::writeImage(kj::ArrayPtr<const byte> data, kj::StringPtr exte
   crypto_generichash_blake2b(hash, sizeof(hash), data.begin(), data.size(), nullptr, 0);
 
   // Write if not already present.
-  auto basename = kj::str(hexEncode(hash), extension);
+  auto basename = kj::str(kj::encodeHex(hash), extension);
   auto filename = kj::str("/var/www/images/", basename);
 
   if (access(filename.cStr(), F_OK) < 0) {
@@ -565,6 +565,16 @@ protected:
       KJ_ASSERT(shortDescription.size() > 0 && shortDescription.size() < 25,
           "bad shortDescription; please provide a 1-to-3 word short description to display "
           "under the app title, e.g. \"Document editor\"");
+
+      KJ_IF_MAYBE(previous, sandstorm::raiiOpenIfExists(
+          kj::str("/var/apps/", appIdString(info.getAppId()), "/metadata"), O_RDONLY)) {
+        capnp::StreamFdMessageReader reader(previous->get());
+        auto previouslyPublished = reader.getRoot<spk::VerifiedInfo>();
+        KJ_ASSERT(info.getVersion() > previouslyPublished.getVersion(),
+            "oops, it looks like you forgot to bump appVersion -- it must be greater than the "
+            "previous published version of this app", previouslyPublished.getVersion());
+      }
+
       auto packageDir = kj::str("/var/packages/", packageIdString(info.getPackageId()));
       auto spkFilename = kj::str(packageDir, "/spk");
       if (access(spkFilename.cStr(), F_OK) < 0) {

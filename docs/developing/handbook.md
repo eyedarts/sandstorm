@@ -19,10 +19,10 @@ Sandstorm, understand the platform and provide the best experience
 possible. Before reading this document, we encourage you try
 Sandstorm, perhaps by visiting https://demo.sandstorm.io/.
 
-The platform is in alpha, so this document is likely to change. We
-will keep old versions of this document online, and we hope that you
-will watch this document over time to update your app as the platform
-updates. There will eventually be API deprecations and
+The platform is always evolving, so this document is likely to
+change. We will keep old versions of this document online, and we hope
+that you will watch this document over time to update your app as the
+platform updates. There will eventually be API deprecations and
 backwards-incompatible breakage, though we aim to keep that to a
 minimum.
 
@@ -65,8 +65,8 @@ provide:
   the GitWeb creates a git repository you can clone from your laptop.
 
 * A user might use a Sandstorm app for personal communication. An
-  example is email; right now, there are two email apps in the
-  Sandstorm app list, Roundcube and Mailpile.
+  example is email; right now, there is one email app in the
+  Sandstorm app market, Roundcube.
 
 These categories are just examples; there are surely other kinds of
 apps that people will dream up.
@@ -139,9 +139,6 @@ extreme end, an app can choose to implement no access control at all,
 and the data can remain safely behind the grain URL and Sandstorm's
 other protections. For example, this is how the EtherCalc port works.
 
-For those with a security background, grain URLs are [capability
-URLs](http://www.w3.org/TR/capability-urls/).
-
 ## Does _not_ implement user accounts or access control
 
 When a user visits an instance of an app, the Sandstorm platform adds
@@ -158,12 +155,7 @@ A third header, `X-Sandstorm-Permissions`, specifies the permissions
 this user has on the particular app instance, such as "read" or
 "write". These permissions are set through the Sandstorm sharing UI,
 outside of the app itself, although the app defines what permissions
-are available in its package definition. (As of this writing, the
-sharing UI is still in development, but you can use permissions to
-distinguish between the grain's owner vs. other users. Currently, the
-owner will always have all defined permissions, whereas other users
-will have none, so you may simply define a permission called `owner`
-or `admin` to distinguish.)
+are available in its package definition.
 
 With these headers in hand, a Sandstorm app can and should avoid
 implementing any internal user model. An app should not ask users to
@@ -182,43 +174,26 @@ example of that in the Sandstorm plugin for GNU MediaGoblin. (See the
 [source
 code](https://github.com/jparyani/mediagoblin/blob/sandstorm-master/mediagoblin/plugins/sandstorm/views.py#L29).)
 
-A different logged-in user can visit the grain URL if the owner of the
-grain sends them a link. At that time, the app will see an
-`X-Sandstorm-User-Id` that it has not seen before. It should typically
-create an account in its user model, whatever that means for the app,
-and automatically log the user into that account.
+A Sandstorm user can create a **sharing link** which grants access to
+the grain to anyone with the link. For those with a security
+background, grain URLs are [capability
+URLs](http://www.w3.org/TR/capability-urls/).
 
-This raises a question: what should the new user be allowed to do? In
-the future, the Sandstorm platform will provide a user interface where
-the owner of a grain can set user permissions for instances of an
-app. For now, though, your app needs to make its own decision about
-the permissions to grant.  As Sandstorm evolves, apps will be able to
-expose their own permission levels in the interface; you can read the
-[full description
-here](https://github.com/sandstorm-io/sandstorm/blob/master/src/sandstorm/grain.capnp#L179).
+A different user can visit the grain if the owner of the grain sends
+them a sharing link. If the user is logged in to Sandstorm, the app
+will see an `X-Sandstorm-User-Id` that it has not seen before. It
+should typically create an account in its user model, whatever that
+means for the app, and automatically log the user into that account.
 
-For a logged-in user who is not the grain owner, apps have made
-different decisions. For a collaborative real-time editor like
-EtherCalc, the maintainer chose to grant total control to all users,
-so sharing the grain link means total authorization to edit the
-spreadsheet. By contrast, in the WordPress port, we made the decision
-to create an account with nearly no permissions. The administrator of
-the WordPress instance can use WordPress's built-in permissions system
-to grant higher access. (Again, keep in mind that this is a temporary
-measure until Sandstorm's own permissions system is complete.)
+When the sharing link was created, Sandstorm asked the user what
+permissions to grant to someone who visits a grain with the link.
+Your app needs to make its own decisions about what permission levels exist.
+[Read more about how to define permissions](/developing/auth#defining-permissions-and-roles).
 
-A totally logged-out user can also visit the grain URL. One reason
-this can happen is that the owner of a grain sends a link to a friend
-because they want to collaborate on something, but that friend doesn't
-have an account on the server. Another reason it might happen is if a
-secondary user Tweets a link to the document. The app can decide how
-to react to non-logged-in users visiting the instance, but usually you
-should give them the same power as would be granted to a
-never-before-seen yet logged-in user. Users will often want to
-collaborate with people who do not have accounts, and forcing
-collaborators to sign up for an account is often a huge barrier,
-especially for relatively non-technical users. This does, however,
-mean that users need to be careful about how they share grain URLs.
+A totally logged-out user can also visit a sharing link. They should
+be granted the same permission level as a logged-in user with the
+same sharing link. In Sandstorm, logging in just means telling the server who
+you are. Sharing links should work no matter who you are.
 
 For those with a security background, the app enforces permissions but
 does not handle authorization (i.e. deciding which permissions to
@@ -326,7 +301,7 @@ available.
 
 The key things to know here is that the app should write an HTML tree
 to /var/www, and then call "publish static" from the
-"HackSessionContext". You can [read more](publishing-apps.md).
+"HackSessionContext". You can [read more](web-publishing.md).
 
 ## Apps can expose an external API for authorized users
 
@@ -419,11 +394,11 @@ of web applications can work.
 
 Thanks for reading this far!
 
-Sandstorm is currently in alpha, and we are continuously developing
-it, so some of these details may change. I hope this has been a useful
+Sandstorm is continuously evolving, and we are continuously developing
+it, so some of these details may change. We hope this has been a useful
 overview of the platform and helps you understand the platform's
-goals. I'm always eager for feedback; email me at
-asheesh@sandstorm.io. This handbook is very abbreviated; consider
+goals. We're always eager for feedback; email us at
+community@sandstorm.io. This handbook is very abbreviated; consider
 following the links in each section for more detail.
 
 To dig into the design of Sandstorm, read through the [Cap'n Proto

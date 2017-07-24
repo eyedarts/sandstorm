@@ -20,7 +20,11 @@
 $import "/capnp/c++.capnp".namespace("sandstorm::spk");
 
 using Util = import "util.capnp";
+using Powerbox = import "powerbox.capnp";
 using Grain = import "grain.capnp";
+using ApiSession = import "api-session.capnp".ApiSession;
+using Identity = import "identity.capnp";
+using WebSession = import "web-session.capnp".WebSession;
 
 struct PackageDefinition {
   id @0 :Text;
@@ -131,7 +135,7 @@ struct Manifest {
       none @0 :Void;
       # This action creates a new grain with no input.
 
-      capability @1 :List(Grain.PowerboxDescriptor);
+      capability @1 :List(Powerbox.PowerboxDescriptor);
       # This action creates a new grain from a powerbox offer. When a capability matching the query
       # is offered to the user (e.g. by another application calling SessionContext.offer()), this
       # action will be listed as one of the things the user can do with it.
@@ -202,15 +206,81 @@ struct BridgeConfig {
   # the user's permissions.
 
   apiPath @1 :Text;
-  # This variable's purpose is two-fold:
-  # First, if it's set to anything non-empty, it will enable ApiSessions in sandstorm-http-bridge.
-  # This means calling newSession with an ApiSession type id will return an ApiSession correctly.
-  # Second, as the name implies, this specifies the path to the API in an app. For example, if
-  # your API endpoints always begin with /v1/api/, then you would provide that path. This path will
-  # always be prepended for you, and clients accessing the API will not have to provide it. This
-  # also has the effect of limiting your clients to only accessing endpoints under that path you
-  # provide. It should always end in a trailing '/'.
-  # "/" is a valid value, and will give clients access to all paths.
+  # Specifies a path which will be prefixed to all API requests -- that is, requests coming in
+  # through the API endpoint as described in:
+  #     https://docs.sandstorm.io/en/latest/developing/http-apis/
+  #
+  # Note that this form of HTTP APIs is old and will eventually be deprecated. In the fantastic
+  # future, available APIs should be defined by `powerboxApis`, below. However, as of this writing,
+  # `powerboxApis` cannot do everything that old-style HTTP APIs do. Why yes, I did once work at
+  # Google, how could you tell?
+  #
+  # apiPath must end with "/".
+  #
+  # WARNING: Specifying this does NOT prevent access to other paths. Anyone holding an API token
+  # can convert it into a sharing token, which provides full access to the grain's web interface.
+  # The purpose of apiPath is only to allow you to design your API URL schema independently of
+  # your UI's URL schema, which is often convenient. To actually restrict what an API token
+  # holder is allowed to do, you MUST use permissions and enforce them for both API and UI
+  # requests. See:
+  #     https://docs.sandstorm.io/en/latest/developing/auth/
+
+  saveIdentityCaps @2 :Bool;
+  # If true, the first time a new user accesses the grain, the bridge will save the user's Identity
+  # capability so that it can be fetched later using `SandstormHttpBridge.getSavedIdentity`. You
+  # will probably want to enable this if your app supports notifications.
+
+  powerboxApis @3 :List(PowerboxApi);
+  struct PowerboxApi {
+    # Defines an HTTP API which this application exports, to which other apps can request access
+    # via the powerbox.
+    #
+    # Use this to define APIs to which other applications can request access.
+    #
+    # Note that this metadata is consulted at the time of a powerbox request. Once the request is
+    # complete and a connection has been formed, future changes to the app's manifest will not
+    # affect the already-made connection.
+
+    name @0 :Text;
+    # Symbolic name for this API. This is passed back to the app as the value of the
+    # `X-Sandstorm-Api` header, in all requests made to this API. Note that removing an API
+    # definition will NOT revoke existing connections formed through the powerbox. So, the app
+    # should be prepared to handle all API names that it has ever defined (or, perhaps, return
+    # an appropriate error when it receives a request for an API that no longer exists).
+
+    displayInfo @1 :Powerbox.PowerboxDisplayInfo;
+    # Information for display to the user when representing this API.
+    #
+    # displayInfo.title in particular will be used when displaying a chooser to the user to choose
+    # among the app's available APIs.
+
+    path @2 :Text;
+    # Specifies the path which will be prefixed to all requests to this API.
+    #
+    # Like `apiPath` (above), this must end with "/". It is perfectly reasonable for the path to be
+    # just "/", if you consider your app's entire HTTP surface to be an API. However, note that
+    # unlike with `apiPath`, restricting a powerbox API to a sub-path actually does prevent
+    # consumers of the API from accessing other paths. You may wish to use this to your advantage.
+
+    tag @3 :ApiSession.PowerboxTag;
+    # Tag defining this API for powerbox matching purposes.
+
+    permissions @4 :Identity.PermissionSet;
+    # The permissions represented by this API. A user interacting with the powerbox will not have
+    # the option of choosing this API unless they possess at least these permissions. Meanwhile,
+    # when a request is made to this API, the `Sandstorm-Permissions` header will always contain
+    # exactly these permissions, even if the user who made the powerbox connection has greater
+    # permissions.
+    #
+    # If not specified, the `X-Sandstorm-Permissions` header will contain the exact list of
+    # permissions that the user had at the time that they formed the connection. Note that if any
+    # of these permissions are later revoked from the user, then the API connection will be revoked
+    # in whole.
+
+    # TODO(someday): Allow non-singleton APIs, for grains that contain many objects. Requires app
+    #   to implement an embeddable picker UI.
+    # TODO(someday): Allow implementing Cap'n Proto APIs via JSON conversion.
+  }
 }
 
 struct Metadata {
@@ -218,7 +288,7 @@ struct Metadata {
   # marketing and display.
   #
   # Technically, appMarketingVersion and appTitle belong in this category, but they were defined
-  # before MarketData became a thing.
+  # before Metadata became a thing.
   #
   # NOTE: Any changes here which add new blobs may require updating the front-end so that it
   #   correctly extracts those blobs into separate assets on install.
@@ -365,7 +435,7 @@ struct Metadata {
     # It is extremely important to users that they be able to verify the author's identity in a way
     # that is not susceptible to spoofing or forgery. Therefore, we *only* identify the author by
     # PGP key. Various PGP infrastructure exists which can be used to determine the author's
-    # identity based on their PGP key. For exmaple, Keybase.io has done a really good job of
+    # identity based on their PGP key. For example, Keybase.io has done a really good job of
     # connecting PGP keys to other Internet identities in a verifiable way.
 
     upstreamAuthor @19 :Text;
@@ -408,7 +478,7 @@ struct Metadata {
   # Where `<key-id>` is a PGP key ID or email address associated with the key.
 
   description @14 :Util.LocalizedText;
-  # The app's description description in Github-flavored Markdown format, to be displayed e.g.
+  # The app's description in Github-flavored Markdown format, to be displayed e.g.
   # in an app store. Note that the Markdown is not permitted to cotnain HTML nor image tags (but
   # you can include a list of screenshots separately).
 
@@ -495,6 +565,7 @@ enum OpenSourceLicense {
   cddl      @15 $osiInfo(id = "CDDL-1.0", title = "CDDL", requireSource = true);
   epl       @16 $osiInfo(id = "EPL-1.0" , title = "Eclipse Public License", requireSource = true);
   cpal      @17 $osiInfo(id = "CPAL-1.0" , title = "Common Public Attribution License", requireSource = true);
+  zlib      @18 $osiInfo(id = "Zlib" , title = "Zlib/libpng License");
 
   # Is your preferred license not on the list? We are happy to add any OSI-approved license; that
   # is, anything on this page:
@@ -583,7 +654,7 @@ enum Category {
   # Content consumption
 
   media @8 $categoryInfo(title = "Media");
-  # Content *consuption*: Apps that aren't used to create content, but are used to display and
+  # Content *consumption*: Apps that aren't used to create content, but are used to display and
   # consume it. Music players, photo galleries, video, feed readers, etc.
 
   games @9 $categoryInfo(title = "Games");

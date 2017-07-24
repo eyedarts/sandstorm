@@ -56,21 +56,29 @@ limits in the future by doing more careful abuse monitoring.
 
 ### Receiving
 
-In this case, receipt of e-mails is already handled for you. Upon your
-grain receiving an e-mail, it will be written to `/var/mail/new`. This
-follows the [maildir](https://en.wikipedia.org/wiki/Maildir)
-convention, and many e-mail apps will be able to use this out of the
-box.
+To receive emails:
+
+- Your app needs to create the [maildir](https://en.wikipedia.org/wiki/Maildir) directories within
+  `/var/mail` - `/var/mail/new` and `/var/mail/cur` and `/var/mail/tmp`. You can do this in e.g.
+  `launcher.sh`.
+
+- Now when your app receives email at its publicId email address
+  (e.g. JBuaKxjkwiJq7oksS@alpha.sandstorm.io), Sandstorm will pass the email to
+  sandstorm-http-bridge, which will save it in `/var/mail` as a Maildir.
+
+- Your app can process the Maildir using whatever tools are convenient for your app. This could take
+  the form of a programming language library, or you could embed a Maildir-aware IMAP daemon into
+  the app such as Dovecot.
 
 ### Sending
 
 Sending e-mails is a bit more tricky. For now, you have to use the
 Cap'n Proto
-[`HackSessionContext`](../blob/master/src/sandstorm/hack-session.capnp)
+[`HackSessionContext`](https://github.com/sandstorm-io/sandstorm/blob/master/src/sandstorm/hack-session.capnp)
 interface that is re-exported by
 sandstorm-http-bridge. sandstorm-http-bridge creates a socket at
 `/tmp/sandstorm-api` and exports a bootstrap
-[`SandstormHttpBridge`](../blob/master/src/sandstorm/sandstorm-http-bridge.capnp)
+[`SandstormHttpBridge`](https://github.com/sandstorm-io/sandstorm/blob/master/src/sandstorm/sandstorm-http-bridge.capnp)
 capability on it. You will need to call `getSessionContext()` with the
 ID that sandstorm-http-bridge places in the `X-Sandstorm-Session-Id`
 header. The result will be a `SessionContext` that can be cast to a
@@ -105,7 +113,7 @@ HackSessionContext](#sending-with-hacksessioncontext).
 ### Receiving through HackSession
 
 Your `UIView.newSession` method (refer to
-[grain.capnp](../blob/master/src/sandstorm/grain.capnp)) must return a
+[grain.capnp](https://github.com/sandstorm-io/sandstorm/blob/master/src/sandstorm/grain.capnp)) must return a
 HackEmailSession. In your HackEmailSession capability, you must
 implement the `send` method, which will be called whenever an e-mail
 is sent to the grain.
@@ -114,7 +122,7 @@ is sent to the grain.
 
 A HackSessionContext is obtained upon call of `UIView.newSession`
 (refer to
-[grain.capnp](../blob/master/src/sandstorm/grain.capnp)). You will be
+[grain.capnp](https://github.com/sandstorm-io/sandstorm/blob/master/src/sandstorm/grain.capnp)). You will be
 passed a HackSessionContext as the 2nd paramater, and it is up to your
 app to store/use it.
 

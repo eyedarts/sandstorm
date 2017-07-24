@@ -42,6 +42,7 @@
 #include <sandstorm/util.h>
 #include <sandstorm/app-index/app-index.capnp.h>
 #include <sandstorm/spk.h>
+#include <sandstorm/id-to-text.h>
 
 #include "indexer.h"
 
@@ -66,12 +67,13 @@ template <typename Context>
 void handleError(Context& context, kj::Exception&& e) {
   KJ_LOG(ERROR, e);
   auto error = context.getResults().initServerError();
-  error.setDescriptionHtml(kj::str("Error: ", htmlEscape(e.getDescription())));
+  error.setDescriptionHtml(kj::str("Error: ", htmlEscape(e.getDescription()), "\n"));
 }
 
 class SubmissionSession final: public ApiSession::Server {
 public:
-  explicit SubmissionSession(Indexer& indexer): indexer(indexer) {}
+  explicit SubmissionSession(Indexer& indexer, HackSessionContext::Client session)
+      : indexer(indexer), session(kj::mv(session)) {}
 
   kj::Promise<void> post(PostContext context) override {
     return kj::evalNow([&]() -> kj::Promise<void> {
@@ -83,7 +85,7 @@ public:
 
         // Write content to upload stream: a write() followed by a done(), and a getResults().
         auto stream = indexer.newUploadStream();
-        auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+        auto promises = kj::heapArrayBuilder<kj::Promise<void>>(3);
         auto req1 = stream.writeRequest();
         req1.setData(content.getContent());
         promises.add(req1.send().then([](auto&&) {}));
@@ -121,7 +123,7 @@ public:
 
         capnp::MallocMessageBuilder response;
         byte appPublicKey[crypto_sign_PUBLICKEYBYTES];
-        if (indexer.tryGetAppId(packageId, appPublicKey)) {
+        if (indexer.tryGetPublicKey(packageId, appPublicKey)) {
           KJ_ASSERT(
               crypto_sign_verify_detached(signature.begin(),
                   requestBytes.begin(), requestBytes.size(), appPublicKey) == 0,
@@ -136,8 +138,7 @@ public:
 
           indexer.getSubmissionStatus(packageId, response);
 
-          auto status = response.getRoot<SubmissionStatus>();
-          if (status.isApproved() && changed) {
+          if (changed) {
             // Force update now!
             indexer.updateIndex();
           }
@@ -163,7 +164,38 @@ public:
         httpResponse.setMimeType("application/octet-stream");
         httpResponse.initBody().setBytes(outStream.getArray());
 
-        return kj::READY_NOW;
+        if (!req.isSetState() ||
+            !response.getRoot<SubmissionStatus>().isPending()) {
+          return kj::READY_NOW;
+        }
+
+        // Send notification email to app index reviewers.
+        auto appTitle = indexer.getAppTitle(packageId);
+        auto notificationText = kj::str(
+            "An app package is pending review in the app index.\n\n"
+            "https://alpha.sandstorm.io/grain/NujwEZfut8oZoSdcrFzy9p/\n\n"
+            "title: ", appTitle, "\n"
+            "packageId: ", packageIdString(req.getPackageId()), "\n"
+            "requested state: ", req.getSetState().getNewState(), "\n");
+
+        return session.getPublicIdRequest().send()
+            .then([this,KJ_MVCAP(appTitle),KJ_MVCAP(notificationText)](auto&& publicId) mutable {
+          return session.getUserAddressRequest().send()
+              .then([this,KJ_MVCAP(appTitle),KJ_MVCAP(notificationText),KJ_MVCAP(publicId)]
+                    (auto&& response) mutable {
+            auto emailReq = session.sendRequest();
+            auto email = emailReq.initEmail();
+            auto from = email.initFrom();
+            from.setName("App Index");
+            from.setAddress(kj::str(publicId.getPublicId(), "@", publicId.getHostname()));
+            auto to = email.initTo(1)[0];
+            to.setAddress("app-index@corp.sandstorm.io");
+            to.setName("App Index Notifications");
+            email.setSubject(kj::str("App index: ", appTitle));
+            email.setText(notificationText);
+            return emailReq.send().ignoreResult();
+          });
+        });
       } else {
         auto error = context.getResults().initClientError();
         error.setStatusCode(WebSession::Response::ClientErrorCode::NOT_FOUND);
@@ -194,6 +226,7 @@ public:
 
 private:
   Indexer& indexer;
+  HackSessionContext::Client session;
 
   class StreamWrapper final: public WebSession::RequestStream::Server {
   public:
@@ -288,6 +321,7 @@ public:
       } else if (path.startsWith("reject/")) {
         indexer.reject(path.slice(strlen("reject/")),
             kj::str(params.getContent().getContent().asChars()));
+        indexer.updateIndex();  // remove from experimental
         context.getResults().initNoContent();
       } else if (path.startsWith("unapprove/")) {
         indexer.unapprove(path.slice(strlen("unapprove/")));
@@ -383,7 +417,8 @@ public:
     if (params.getSessionType() == capnp::typeId<ApiSession>()) {
       KJ_REQUIRE(hasPermission(SUBMIT_PERMISSION),
                  "client does not have permission to submit apps; can't use API");
-      result = kj::heap<SubmissionSession>(indexer);
+      result = kj::heap<SubmissionSession>(
+          indexer, params.getContext().castAs<HackSessionContext>());
     } else if (params.getSessionType() == capnp::typeId<WebSession>()) {
       KJ_REQUIRE(hasPermission(REVIEW_PERMISSION),
                  "client does not have permission to review apps; can't use web interface");
@@ -418,9 +453,11 @@ public:
 
   kj::MainBuilder::Validity init() {
     KJ_SYSCALL(mkdir("/var/packages", 0777));
+    KJ_SYSCALL(mkdir("/var/apps", 0777));
     KJ_SYSCALL(mkdir("/var/keybase", 0777));
     KJ_SYSCALL(mkdir("/var/www", 0777));
     KJ_SYSCALL(mkdir("/var/www/apps", 0777));
+    KJ_SYSCALL(mkdir("/var/www/experimental", 0777));
     KJ_SYSCALL(mkdir("/var/www/images", 0777));
     KJ_SYSCALL(mkdir("/var/www/packages", 0777));
     KJ_SYSCALL(mkdir("/var/tmp", 0777));
@@ -428,6 +465,9 @@ public:
   }
 
   kj::MainBuilder::Validity run() {
+    mkdir("/var/www/experimental", 0777);  // back-compat; ignore already exists error
+    mkdir("/var/apps", 0777);  // back-compat; ignore already exists error
+
     Indexer indexer;
 
     // Set up RPC on file descriptor 3.

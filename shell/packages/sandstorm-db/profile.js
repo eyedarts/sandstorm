@@ -14,51 +14,109 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-var makeIdenticon;
-var httpProtocol;
-var sha256;
+let makeIdenticon;
+let httpProtocol;
 
 if (Meteor.isServer) {
+  SandstormDb.ensureSubscriberHasIdentity = function (publishHandler, identityId) {
+    // Helper for publish functions that need to restrict access based on whether the subscriber
+    // has a given identity linked. Automatically stops the subscription if the user loses the
+    // identity. Returns a boolean indicating whether the user initially has the identity.
+
+    const userId = publishHandler.userId;
+    if (userId === identityId) {
+      return true;
+    } else {
+      const hasIdentityCursor = Meteor.users.find({
+        $or: [
+          {
+            _id: userId,
+            "loginIdentities.id": identityId,
+          },
+          {
+            _id: userId,
+            "nonloginIdentities.id": identityId,
+          },
+        ],
+      });
+      if (hasIdentityCursor.count() == 0) {
+        publishHandler.stop();
+        return false;
+      }
+
+      const handle = hasIdentityCursor.observe({ removed: function () { publishHandler.stop(); } });
+
+      publishHandler.onStop(function () { handle.stop(); });
+
+      return true;
+    }
+  };
+
+  Meteor.publish("identityProfile", function (identityId) {
+    check(identityId, String);
+    if (!SandstormDb.ensureSubscriberHasIdentity(this, identityId)) return;
+
+    return Meteor.users.find({ _id: identityId },
+      { fields: {
+        profile: 1,
+        unverifiedEmail: 1,
+        expires: 1,
+        createdAt: 1,
+
+        "services.dev.name": 1,
+
+        "services.google.id": 1,
+        "services.google.email": 1,
+        "services.google.verified_email": 1,
+        "services.google.name": 1,
+        "services.google.picture": 1,
+        "services.google.gender": 1,
+        "services.google.hd": 1,
+
+        "services.github.id": 1,
+        "services.github.email": 1,
+        "services.github.emails": 1,
+        "services.github.username": 1,
+
+        "services.email.email": 1,
+
+        "services.ldap.id": 1,
+        "services.ldap.username": 1,
+        "services.ldap.rawAttrs": 1,
+
+        "services.saml.id": 1,
+        "services.saml.email": 1,
+        "services.saml.displayName": 1,
+      },
+    });
+  }),
+
   Meteor.publish("accountIdentities", function () {
-    if (!Meteor.userId) return [];
+    // Maybe this should be folded into the "credentials" subscription?
 
-    return [
-      Meteor.users.find(Meteor.userId,
-        {fields: {
-          "profile":1,
-          "devName":1,
-          "expires":1,
+    if (!this.userId) return [];
 
-          "services.google.id":1,
-          "services.google.email":1,
-          "services.google.verified_email":1,
-          "services.google.name":1,
-          "services.google.picture":1,
-          "services.google.gender":1,
-
-          "services.github.id":1,
-          "services.github.email":1,
-          "services.github.username":1,
-
-          "services.emailToken.email":1
-        }})
-    ];
+    return Meteor.users.find(
+      { _id: this.userId },
+      { fields: {
+        profile: 1,
+        verifiedEmail: 1,
+        loginIdentities: 1,
+        nonloginIdentities: 1,
+        expires: 1,
+        primaryEmail: 1,
+      }, });
   });
 
   makeIdenticon = function (id) {
-    // We only make identicons client-side.
-    return undefined;
-  }
-
-  var Url = Npm.require("url");
-  httpProtocol = Url.parse(process.env.ROOT_URL).protocol;
-
-  var Crypto = Npm.require("crypto");
-  sha256 = function (data) {
-    return Crypto.createHash("sha256").update(data).digest("hex");
+    const hash = id.slice(0, 32);
+    return httpProtocol + "//" + makeWildcardHost("static") + "/identicon/" + hash + "?s=256";
   };
+
+  const Url = Npm.require("url");
+  httpProtocol = Url.parse(process.env.ROOT_URL).protocol;
 } else {
-  var identiconCache = {};
+  const identiconCache = {};
 
   makeIdenticon = function (id) {
     // Given a cryptographic hash as input, generate an identicon. We always use the user's
@@ -68,27 +126,23 @@ if (Meteor.isServer) {
     // that apps can themselves use identicon.js to produce consistent identicons. As it turns out
     // identicon.js doesn't use the second half of the hash even if we provide it, but slice it
     // anyway to be safe.
-    id = id.slice(0, 32);
+    const hash = id.slice(0, 32);
 
-    if (id in identiconCache) {
-      return identiconCache[id];
+    if (hash in identiconCache) {
+      return identiconCache[hash];
     }
 
     // Unfortunately, Github's algorithm uses MD5. Whatever, we don't expect these to be secure.
-    var data = new Identicon(id, 512).toString();
-    var result = "data:image/png;base64," + data;
-    identiconCache[id] = result;
+    const data = new Identicon(hash, 512).toString();
+    const result = "data:image/svg+xml," + encodeURIComponent(data);
+    identiconCache[hash] = result;
     return result;
-  }
+  };
 
   httpProtocol = window.location.protocol;
-
-  sha256 = function (data) {
-    return CryptoJS.SHA256(data).toString();
-  };
 }
 
-var GENDERS = {male: "male", female: "female", neutral: "neutral", robot: "robot"};
+const GENDERS = { male: "male", female: "female", neutral: "neutral", robot: "robot" };
 
 function staticAssetUrl(id, staticHost) {
   if (id) {
@@ -110,16 +164,19 @@ function emailToHandle(email) {
 
   // Use the stuff before the @. Ignore stuff after '+' because it's commonly used for filters
   // on the same account.
-  var parts = email.split("@");
-  var base = filterHandle(parts[0].split("+")[0]);
+  const parts = email.split("@");
+  let base = filterHandle(parts[0].split("+")[0]);
 
-  var domain = (parts[1]||"").split(".");
+  const domain = (parts[1] || "").split(".");
   if (domain[domain.length - 1] === "name") {
     // Oh, a .name domain. Let's use
     base = filterHandle(domain.slice(0, domain.length - 1).join("."));
-  } else if (_.contains(["me", "self", "contact", "admin", "administrator", "root", "info",
-                         "sandstorm", "sandstormio", "inbox", "indiegogo", "mail", "email"],
-                         base)) {
+  } else if (_.contains(
+      [
+        "me", "self", "contact", "admin", "administrator", "root", "info",
+        "sandstorm", "sandstormio", "inbox", "indiegogo", "mail", "email",
+      ],
+      base)) {
     // This is probably an address at a vanity domain. Use the domain itself as the handle.
     base = filterHandle(domain[0]);
   }
@@ -127,132 +184,200 @@ function emailToHandle(email) {
   return filterHandle(base);
 }
 
-function identityId(service, id) {
-  return sha256(service + ":" + id);
-}
-
-function googleIdentity(user, staticHost) {
-  var google = (user.services && user.services.google) || {};
-  var profile = user.profile || {};
-  var id = identityId("google", google.id);
-
-  return {
-    service: "google",
-    id: id,
-    name: profile.name || google.name || "Name Unknown",
-    email: profile.email || google.email,
-    handle: profile.handle || emailToHandle(google.email) ||
-            filterHandle(profile.name || google.name) || "unknown",
-    picture: staticAssetUrl(profile.picture, staticHost) || makeIdenticon(id),
-    pronoun: profile.pronoun || GENDERS[google.gender] || "neutral",
+SandstormDb.fillInProfileDefaults = function (user) {
+  const profile = user.profile;
+  if (profile.service === "github") {
+    profile.name = profile.name || user.services.github.username || "Name Unknown";
+    profile.handle = profile.handle || filterHandle(user.services.github.username) ||
+        filterHandle(profile.name);
+  } else if (profile.service === "google") {
+    profile.name = profile.name || user.services.google.name || "Name Unknown";
+    profile.handle = profile.handle || emailToHandle(user.services.google.email) ||
+        filterHandle(profile.name);
+    profile.pronoun = profile.pronoun || GENDERS[user.services.google.gender] || "neutral";
+  } else if (profile.service === "email") {
+    const email = user.services.email.email;
+    profile.name = profile.name || emailToHandle(email);
+    profile.handle = profile.handle || emailToHandle(email);
+  } else if (profile.service === "dev") {
+    const lowerCaseName = user.services.dev.name.split(" ")[0].toLowerCase();
+    profile.name = profile.name || user.services.dev.name;
+    profile.handle = profile.handle || filterHandle(lowerCaseName);
+    profile.pronoun = profile.pronoun ||
+        (_.contains(["alice", "carol", "eve"], lowerCaseName) ? "female" :
+         _.contains(["bob", "dave"], lowerCaseName) ? "male" : "neutral");
+  } else if (profile.service === "demo") {
+    profile.name = profile.name || "Demo User";
+    profile.handle = profile.handle || "demo";
+  } else if (profile.service === "ldap") {
+    const setting = Settings.findOne({ _id: "ldapNameField" });
+    const key = setting ? setting.value : "";
+    profile.handle = profile.handle || user.services.ldap.username;
+    profile.name = profile.name || user.services.ldap.rawAttrs[key] || profile.handle;
+  } else if (profile.service === "saml") {
+    profile.handle = profile.handle || emailToHandle(user.services.saml.email);
+    profile.name = profile.name || user.services.saml.displayName || profile.handle;
+  } else {
+    throw new Error("unrecognized identity service: ", profile.service);
   }
-}
 
-function githubIdentity(user, staticHost) {
-  var github = (user.services && user.services.github) || {};
-  var profile = user.profile || {};
-  var id = identityId("github", github.id);
+  profile.pronoun = profile.pronoun || "neutral";
+};
 
-  return {
-    service: "github",
-    id: id,
-    name: profile.name || github.username || "Name Unknown",
-    email: profile.email || github.email,
-    handle: profile.handle || filterHandle(github.username) ||
-            filterHandle(profile.name) || "unknown",
-    picture: staticAssetUrl(profile.picture, staticHost) || makeIdenticon(id),
-    pronoun: profile.pronoun,
+SandstormDb.fillInIntrinsicName = function (user) {
+  const profile = user.profile;
+  if (profile.service === "github") {
+    profile.intrinsicName = user.services.github.username;
+  } else if (profile.service === "google") {
+    profile.intrinsicName = user.services.google.name;
+    user.privateIntrinsicName = user.services.google.email;
+  } else if (profile.service === "email") {
+    profile.intrinsicName = user.services.email.email;
+  } else if (profile.service === "dev") {
+    profile.intrinsicName = user.services.dev.name;
+  } else if (profile.service === "demo") {
+    profile.intrinsicName = "demo on " + user.createdAt.toISOString().substring(0, 10);
+  } else if (profile.service === "ldap") {
+    profile.intrinsicName = user.services.ldap.username;
+  } else if (profile.service === "saml") {
+    profile.intrinsicName = user.services.saml.id;
+  } else {
+    throw new Error("unrecognized identity service: ", profile.service);
   }
-}
+};
 
-function emailIdentity(user, staticHost) {
-  var email = (user.services && user.services.emailToken) || {};
-  var profile = user.profile || {};
-  var id = identityId("email", email.email);
+SandstormDb.fillInLoginId = function (identity) {
+  const service = identity.profile.service;
+  identity.loginId = Accounts.identityServices[service].getLoginId(identity);
+};
 
-  return {
-    service: "email",
-    id: id,
-    name: profile.name || email.email.split("@")[0] || "Name Unknown",
-    email: profile.email || email.email,
-    handle: profile.handle || emailToHandle(email.email) ||
-            filterHandle(profile.name) || "unknown",
-    picture: staticAssetUrl(profile.picture, staticHost) || makeIdenticon(id),
-    pronoun: profile.pronoun,
+SandstormDb.getVerifiedEmails = function (identity) {
+  if (identity.services.google && identity.services.google.email &&
+      identity.services.google.verified_email) { // jscs:ignore requireCamelCaseOrUpperCaseIdentifiers
+    return [{ email: identity.services.google.email, primary: true }];
+  } else if (identity.services.email) {
+    return [{ email: identity.services.email.email, primary: true }];
+  } else if (identity.services.github && identity.services.github.emails) {
+    return _.chain(identity.services.github.emails)
+      .filter(function (email) { return email.verified; })
+      .map((email) => _.pick(email, "email", "primary"))
+      .value();
+  } else if (identity.services.ldap) {
+    // TODO(cleanup): don't create a new SandstormDb here, make this non-static
+    const email = identity.services.ldap.rawAttrs[new SandstormDb().getLdapEmailField()];
+    if (email) {
+      return [{ email: email, primary: true }];
+    }
+  } else if (identity.services.saml && identity.services.saml.email) {
+    return [{ email: identity.services.saml.email, primary: true }];
   }
-}
 
-function devIdentity(user, staticHost) {
-  var email = (user.services && user.services.emailToken) || {};
-  var profile = user.profile || {};
-  var name = user.devName.split(" ")[0].toLowerCase();
-  var id = identityId("dev", user.devName);
+  return [];
+};
 
-  return {
-    service: "dev",
-    id: id,
-    name: profile.name || user.devName,
-    handle: profile.handle || filterHandle(name),
-    picture: staticAssetUrl(profile.picture, staticHost) || makeIdenticon(id),
-    pronoun: profile.pronoun ||
-             (_.contains(["alice", "carol", "eve"], name) ? "female" :
-              _.contains(["bob", "dave"], name) ? "male" : "neutral"),
+SandstormDb.prototype.findIdentitiesByEmail = function (email) {
+  // Returns an array of identities which have the given email address as one of their verified
+  // addresses.
+
+  check(email, String);
+
+  // For LDAP, the field containing the e-mail address is configurable...
+  const ldapQuery = {};
+  ldapQuery["services.ldap.rawAttrs." + this.getLdapEmailField()] = email;
+
+  return Meteor.users.find({ $or: [
+    { "services.google.email": email },
+    { "services.email.email": email },
+    { "services.github.emails.email": email },
+    ldapQuery,
+    { "services.saml.email": email },
+  ], }).fetch().filter(function (identity) {
+    // Verify that the email is verified, since our query doesn't technically do that.
+    return !!_.findWhere(SandstormDb.getVerifiedEmails(identity), { email: email });
+  });
+};
+
+SandstormDb.prototype.findAccountsByEmail = function (email) {
+  const identityIds = _.pluck(this.findIdentitiesByEmail(email), "_id");
+  return Meteor.users.find({ $or: [
+    { "loginIdentities.id": { $in: identityIds } },
+    { "nonloginIdentities.id": { $in: identityIds } },
+  ], }).fetch();
+};
+
+SandstormDb.fillInPictureUrl = function (user) {
+  const staticHost = httpProtocol + "//" + makeWildcardHost("static");
+  user.profile.pictureUrl = staticAssetUrl(user.profile.picture, staticHost) ||
+    makeIdenticon(user._id);
+};
+
+SandstormDb.getUserIdentityIds = function (user) {
+  // Given an account user object, returns an array containing the ID of each identity linked to the
+  // account. Always returns the most recently added login identity first.
+  if (user && user.loginIdentities) {
+    return _.pluck(user.nonloginIdentities.concat(user.loginIdentities), "id").reverse();
+  } else {
+    return [];
   }
-}
+};
 
-function demoIdentity(user, staticHost) {
-  var email = (user.services && user.services.emailToken) || {};
-  var profile = user.profile || {};
-  var id = identityId("demo", user._id);
-
-  return {
-    service: "demo",
-    id: id,
-    name: profile.name || "Demo User",
-    handle: profile.handle || "demo",
-    picture: staticAssetUrl(profile.picture, staticHost) || makeIdenticon(id),
-    pronoun: profile.pronoun || "neutral",
-  }
-}
-
-SandstormDb.getVerifiedEmails = function (user) {
-  var result = [];
-
-  var services = user.services || {};
-  var google = services.google || {};
-  if (google.email && google.verified_email) result.push(google.email);
-  if (services.emailToken) result.push(services.emailToken.email);
-
-  // TODO(soon): Verification of email addresses -- perhaps through asking the user to log in as
-  //   the given identity?
-
-  return result;
-}
-
-SandstormDb.getUserIdentities = function (user) {
-  // Given a user object, return all of the user's identities.
+SandstormDb.getUserEmails = function (user) {
+  // Given a user object, returns an array containing all email addresses associated with that user.
+  // Each entry in the array is an object of the form:
+  //     `{email: String, verified: Bool, primary: Optional(Bool)}`
   //
-  // On the client, must be subscribed "accountIdentities" for the user.
+  // At most one entry in the result has `primary = true`.
+  //
+  // TODO(cleanup): This actually does need to query the database to fetch profile information
+  //   for linked identities, so it probably makes more sense for it to be a non-static method
+  //   on SandstormDb.
 
-  var staticHost = httpProtocol + "//" + makeWildcardHost("static");
+  const identityIds = SandstormDb.getUserIdentityIds(user);
+  const verifiedEmails = {};
+  const unverifiedEmails = {};
 
-  var result = [];
-  if (user && user.services) {
-    if ("google" in user.services) {
-      result.push(googleIdentity(user, staticHost));
+  identityIds.forEach(function (id) {
+    const identity = Meteor.users.findOne({ _id: id });
+    if (identity && identity.services) {
+      SandstormDb.getVerifiedEmails(identity).forEach(function (verifiedEmail) {
+        if (verifiedEmail) {
+          verifiedEmails[verifiedEmail.email] = true;
+        }
+      });
     }
-    if ("github" in user.services) {
-      result.push(githubIdentity(user, staticHost));
+
+    if (identity && identity.unverifiedEmail) {
+      unverifiedEmails[identity.unverifiedEmail] = true;
     }
-    if ("emailToken" in user.services) {
-      result.push(emailIdentity(user, staticHost));
-    }
-    if ("devName" in user) {
-      result.push(devIdentity(user, staticHost));
-    }
-    if ("expires" in user) {
-      result.push(demoIdentity(user, staticHost));
-    }
+  });
+
+  const result = [];
+  _.keys(verifiedEmails).map(function (email) {
+    result.push({ email: email,
+                  verified: true,
+                  primary: email === user.primaryEmail, });
+  });
+
+  _.keys(unverifiedEmails).map(function (email) {
+    if (!(email in verifiedEmails)) { result.push({ email: email, verified: false }); }
+  });
+
+  // If `user.primaryEmail` is not among the verified emails, mark the first as primary.
+  if (!(user.primaryEmail in verifiedEmails) && result.length > 0) {
+    result[0].primary = true;
   }
+
   return result;
-}
+};
+
+SandstormDb.prototype.addContact = function addContact(ownerId, identityId) {
+  check(ownerId, String);
+  check(identityId, String);
+  const profile = this.getIdentity(identityId).profile;
+  this.collections.contacts.upsert({ ownerId: ownerId, identityId: identityId }, {
+    ownerId: ownerId,
+    petname: profile && profile.name,
+    created: new Date(),
+    identityId: identityId,
+  });
+};

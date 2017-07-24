@@ -17,24 +17,32 @@
 "use strict";
 
 var utils = require("../utils"),
+    actionSelector = utils.actionSelector,
+    appSelector = utils.appSelector,
     short_wait = utils.short_wait,
     medium_wait = utils.medium_wait,
     long_wait = utils.long_wait,
     very_long_wait = utils.very_long_wait;
 
 exports.command = function(url, packageId, appId, dontStartGrain, callback) {
-  var ret = this
-    .loginDevAccount()
+  var browser = this;
+  var ret = browser
+    .init()
     .url(this.launch_url + "/install/" + packageId + "?url=" + url)
     .waitForElementVisible("#step-confirm", very_long_wait)
     .click("#confirmInstall")
-    .url(this.launch_url + "/grain/new")
+    .url(this.launch_url + "/apps")
     .waitForElementVisible(".app-list", medium_wait)
     .resizeWindow(utils.default_width, utils.default_height);
 
   if (!dontStartGrain) {
     ret = ret
-      .click('.app-list>.app-action[data-app-id="' + appId + '"]')
+      // The introjs overlay often doesn't destroy itself fast enough and intercepts
+      // clicks that we don't want it to intercept. So we manually disable it here.
+      .disableGuidedTour()
+      .click(appSelector(appId))
+      .waitForElementVisible(actionSelector, short_wait)
+      .click(actionSelector)
       .waitForElementVisible("#grainTitle", medium_wait);
   }
 

@@ -1,18 +1,13 @@
-Title: Can install without root, with -u
-Vagrant-Box: default
+Title: Ensure a non-root dev install with -u can succeed, prompting for all questions
+Vagrant-Box: jessie
 Vagrant-Destroy-If-bash: -d $HOME/sandstorm
-Vagrant-Precondition-bash: ! -d $HOME/sandstorm
-Cleanup: uninstall_sandstorm(parsed_headers['vagrant-box'])
+Cleanup: uninstall_sandstorm
 
-$[run]CURL_USER_AGENT=testing /vagrant/install.sh -u
-$[slow]Sandstorm makes it easy to run web apps on your own server. You can have:
-
-1. A full server with automatic setup (press enter to accept this default)
-2. A development server, for writing apps.
-
-How are you going to use this Sandstorm install? [1] $[type]2
+$[run]CURL_USER_AGENT=testing REPORT=no /vagrant/install.sh -u
+$[slow]Sandstorm makes it easy to run web apps on your own server.
 Expose to localhost only? [yes] $[type]
 Where would you like to put Sandstorm? $[type]
+Sandstorm grains can receive email.$[type]
 Automatically keep Sandstorm updated? [yes]$[type]
 Sandstorm supports 'dev accounts', a feature that lets anyone log in
 as admin and other sample users to a Sandstorm server. We recommend
@@ -41,14 +36,12 @@ Wildcard host: [*.local.sandstorm.io:6080]$[type]
 Config written to
 Finding latest build for dev channel...
 $[veryslow]Downloading: https://dl.sandstorm.io/sandstorm-
-$[veryslow]Start sandstorm at system boot (using sysvinit)? [yes] $[type]
-Setup complete. To start your server now, run:
+$[veryslow]GPG signature is valid.
+$[slow]Installation complete. To start your server now, run:
 sandstorm start
-You should then configure the site at:
-  http://local.sandstorm.io:6080/admin/
-WARNING: This token expires in 15 minutes.
-You can generate a new token by running 'sandstorm admin-token' from the command line
-
+Once that's done, visit this link to start using it:
+  http://local.sandstorm.io:6080/
+NOTE: Use the passwordless admin account
 To learn how to control the server, run:
 help
 $[exitcode]0

@@ -24,6 +24,7 @@
 #include <capnp/rpc-twoparty.h>
 #include <capnp/rpc.capnp.h>
 #include <unistd.h>
+#include <netinet/in.h> // needs to be included before sys/capability.h
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/time.h>
@@ -35,7 +36,6 @@
 #include <sys/capability.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
-#include <netinet/in.h>
 #include <linux/sockios.h>
 #include <linux/route.h>
 #include <sandstorm/ip_tables.h>  // created by Makefile from <linux/netfilter_ipv4/ip_tables.h>
@@ -49,13 +49,26 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/inotify.h>
-#include <seccomp.h>
 #include <map>
 #include <unordered_map>
 #include <execinfo.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <sys/eventfd.h>
+#include <sys/resource.h>
+
+// We need to define these constants before libseccomp has a chance to inject bogus
+// values for them. See https://github.com/seccomp/libseccomp/issues/27
+#ifndef __NR_seccomp
+#define __NR_seccomp 317
+#endif
+#ifndef __NR_bpf
+#define __NR_bpf 321
+#endif
+#ifndef __NR_userfaultfd
+#define __NR_userfaultfd 323
+#endif
+#include <seccomp.h>
 
 #include <sandstorm/grain.capnp.h>
 #include <sandstorm/supervisor.capnp.h>
@@ -74,12 +87,13 @@ namespace sandstorm {
 // =======================================================================================
 // Directory size watcher
 
-class DiskUsageWatcher {
+class DiskUsageWatcher: private kj::TaskSet::ErrorHandler {
   // Class which watches a directory tree, counts up the total disk usage, and fires events when
   // it changes. Uses inotify. Which turns out to be... harder than it should be.
 
 public:
-  DiskUsageWatcher(kj::UnixEventPort& eventPort): eventPort(eventPort) {}
+  DiskUsageWatcher(kj::UnixEventPort& eventPort, kj::Timer& timer, SandstormCore::Client core)
+      : eventPort(eventPort), timer(timer), core(kj::mv(core)), tasks(*this) {}
 
   kj::Promise<void> init() {
     // Start watching the current directory.
@@ -103,35 +117,15 @@ public:
     return readLoop();
   }
 
-  uint64_t getSize() { return totalSize; }
-
-  kj::Promise<uint64_t> getSizeWhenChanged(uint64_t oldSize) {
-    kj::Promise<void> trigger = nullptr;
-    if (totalSize == oldSize) {
-      auto paf = kj::newPromiseAndFulfiller<void>();
-      trigger = kj::mv(paf.promise);
-      listeners.add(kj::mv(paf.fulfiller));
-    } else {
-      trigger = kj::READY_NOW;
-    }
-
-    // Even when the value has changed, wait 100ms so that we're not streaming tons of updates
-    // whenever there is heavy disk I/O. This is just for a silly display anyway.
-    return trigger.then([this]() {
-      return eventPort.atSteadyTime(eventPort.steadyTime() + 100 * kj::MILLISECONDS);
-    }).then([this]() {
-      return totalSize;
-    });
-  }
-
 private:
   kj::UnixEventPort& eventPort;
+  kj::Timer& timer;
+  SandstormCore::Client core;
   kj::AutoCloseFd inotifyFd;
   kj::Own<kj::UnixEventPort::FdObserver> observer;
   uint64_t totalSize;
-
-  uint64_t lastUpdateSize = kj::maxValue;  // value of totalSize last time listeners were fired.
-  kj::Vector<kj::Own<kj::PromiseFulfiller<void>>> listeners;
+  uint64_t reportedSize = kj::maxValue;
+  bool reportInFlight = false;
 
   struct ChildInfo {
     kj::String name;
@@ -148,6 +142,8 @@ private:
   // Directories we would like to watch, but we can't add watches on them just yet because we need
   // to finish processing a list of events received from inotify before we mess with the watch
   // descriptor table.
+
+  kj::TaskSet tasks;
 
   void addPendingWatches() {
     // Start watching everything that has been added to the pendingWatches list.
@@ -240,7 +236,7 @@ private:
 
   kj::Promise<void> readLoop() {
     addPendingWatches();
-    maybeFireEvents();
+    maybeReportSize();
     return observer->whenBecomesReadable().then([this]() {
       alignas(uint64_t) kj::byte buffer[4096];
 
@@ -330,6 +326,8 @@ private:
       iter->second.size = usage.bytes;
     }
 
+    maybeReportSize();
+
     // If the child is a directory, plan to start watching it later. Note that IN_MODIFY events
     // are not generated for subdirectories (only files), so if we got an event on a directory it
     // must be create, move to, move from, or delete. In the latter two cases, the node wouldn't
@@ -367,8 +365,8 @@ private:
         result.path = kj::mv(path);
         result.isDir = S_ISDIR(stats.st_mode);
 
-        // Round the size up to the nearest block; we assume 4k blocks.
-        result.bytes = (stats.st_size + 4095) & ~4095ull;
+        // Count blocks, not length, because what we care about is allocated space.
+        result.bytes = stats.st_blocks * 512;
 
         if (stats.st_nlink != 0) {
           // Note: sometimes the link count actually is zero; it often is, for example, during
@@ -376,10 +374,6 @@ private:
 
           // Divide by link count so that files with many hardlinks aren't overcounted.
           result.bytes /= stats.st_nlink;
-
-          // Add sizeof(stats) to approximate the directory entry overhead, and also add
-          // the size of the null-terminated filename rounded up to a word.
-          result.bytes += sizeof(stats) + ((name.size() + 8) & ~7ull);
         }
 
         return result;
@@ -401,14 +395,47 @@ private:
     }
   }
 
-  void maybeFireEvents() {
-    if (totalSize != lastUpdateSize) {
-      for (auto& listener: listeners) {
-        listener->fulfill();
-      }
-      listeners.resize(0);
-      lastUpdateSize = totalSize;
-    }
+  void maybeReportSize() {
+    // Don't send multiple reports at once. When the first one finishes we'll send another one if
+    // the size has changed in the meantime.
+    if (reportInFlight) return;
+
+    // If the last reported size is still correct, don't report.
+    if (reportedSize == totalSize) return;
+
+    reportInFlight = true;
+
+    // Wait 500ms before reporting to gather other changes.
+    tasks.add(timer.afterDelay(500 * kj::MILLISECONDS)
+        .then([this]() -> kj::Promise<void> {
+      auto req = core.reportGrainSizeRequest();
+      uint64_t sizeBeingReported = totalSize;
+      req.setBytes(sizeBeingReported);
+
+      return req.send().then([this,sizeBeingReported](auto) -> void {
+        reportInFlight = false;
+        reportedSize = sizeBeingReported;
+
+        // If the size has changed further, initiate a new report.
+        maybeReportSize();
+      }, [this](kj::Exception&& e) {
+        reportInFlight = false;
+
+        if (e.getType() == kj::Exception::Type::DISCONNECTED) {
+          // SandstormCore disconnected. Due to our CoreRedirector logic, it will restore itself
+          // eventually, and in fact further calls to SandstormCore should block until than
+          // happens. So, initiate a new report immediately.
+          maybeReportSize();
+        } else {
+          // Some other error. Propagate.
+          kj::throwFatalException(kj::mv(e));
+        }
+      });
+    }));
+  }
+
+  void taskFailed(kj::Exception&& exception) override {
+    KJ_LOG(ERROR, exception);
   }
 };
 
@@ -500,7 +527,7 @@ void registerSignalHandlers() {
   action.sa_handler = &signalHandler;
   sigfillset(&action.sa_mask);
 
-  // SIGALRM will fire every five minutes and will kill us if no keepalive was received in that
+  // SIGALRM will fire every 1.5 minutes and will kill us if no keepalive was received in that
   // time.
   KJ_SYSCALL(sigaction(SIGALRM, &action, nullptr));
 
@@ -537,6 +564,9 @@ kj::MainFunc SupervisorMain::getMain() {
                          "Runs a Sandstorm grain supervisor for the grain <grain-id>, which is "
                          "an instance of app <app-id>.  Executes <command> inside the grain "
                          "sandbox.")
+      .addOptionWithArg({"uid"}, KJ_BIND_METHOD(*this, setUid), "<uid>",
+                        "Use setuid sandbox rather than userns. Must start as root, but swiches "
+                        "to <uid> to run the app.")
       .addOptionWithArg({"pkg"}, KJ_BIND_METHOD(*this, setPkg), "<path>",
                         "Set directory containing the app package.  "
                         "Defaults to '$SANDSTORM_HOME/var/sandstorm/apps/<app-name>'.")
@@ -604,6 +634,22 @@ kj::MainBuilder::Validity SupervisorMain::setVar(kj::StringPtr path) {
   return true;
 }
 
+kj::MainBuilder::Validity SupervisorMain::setUid(kj::StringPtr arg) {
+  KJ_IF_MAYBE(u, parseUInt(arg, 10)) {
+    if (getuid() != 0) {
+      return "must start as root to use --uid";
+    }
+    if (*u == 0) {
+      return "can't run sandbox as root";
+    }
+    KJ_SYSCALL(seteuid(*u));
+    sandboxUid = *u;
+    return true;
+  } else {
+    return "UID must be a number";
+  }
+}
+
 kj::MainBuilder::Validity SupervisorMain::addEnv(kj::StringPtr arg) {
   environment.add(kj::heapString(arg));
   return true;
@@ -617,14 +663,16 @@ kj::MainBuilder::Validity SupervisorMain::addCommandArg(kj::StringPtr arg) {
 // =====================================================================================
 
 kj::MainBuilder::Validity SupervisorMain::run() {
-  isIpTablesAvailable = checkIfIpTablesLoaded();
-
   setupSupervisor();
 
   // Exits if another supervisor is still running in this sandbox.
   systemConnector->checkIfAlreadyRunning();
 
-  SANDSTORM_LOG("Starting up grain.");
+  if (sandboxUid == nullptr) {
+    SANDSTORM_LOG("Starting up grain. Sandbox type: userns");
+  } else {
+    SANDSTORM_LOG("Starting up grain. Sandbox type: privileged");
+  }
 
   registerSignalHandlers();
 
@@ -707,6 +755,7 @@ void SupervisorMain::setupSupervisor() {
   KJ_SYSCALL(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
 
   closeFds();
+  setResourceLimits();
   checkPaths();
   unshareOuter();
   setupFilesystem();
@@ -768,6 +817,14 @@ void SupervisorMain::closeFds() {
       close(fd);
     }
   }
+}
+
+void SupervisorMain::setResourceLimits() {
+  struct rlimit limit;
+  memset(&limit, 0, sizeof(limit));
+  limit.rlim_cur = 1024;
+  limit.rlim_max = 4096;
+  KJ_SYSCALL(setrlimit(RLIMIT_NOFILE, &limit));
 }
 
 void SupervisorMain::checkPaths() {
@@ -833,21 +890,51 @@ void SupervisorMain::writeUserNSMap(const char *type, kj::StringPtr contents) {
 }
 
 void SupervisorMain::unshareOuter() {
-  pid_t uid = getuid(), gid = getgid();
+  if (sandboxUid == nullptr) {
+    // Use user namespaces.
+    pid_t uid = getuid(), gid = getgid();
 
-  // Unshare all of the namespaces except network.  Note that unsharing the pid namespace is a
-  // little odd in that it doesn't actually affect this process, but affects later children
-  // created by it.
-  KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWPID));
+    // Unshare all of the namespaces except network.  Note that unsharing the pid namespace is a
+    // little odd in that it doesn't actually affect this process, but affects later children
+    // created by it.
+    KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWPID));
 
-  // Map ourselves as 1000:1000, since it costs nothing to mask the uid and gid.
-  writeSetgroupsIfPresent("deny\n");
-  writeUserNSMap("uid", kj::str("1000 ", uid, " 1\n"));
-  writeUserNSMap("gid", kj::str("1000 ", gid, " 1\n"));
+    // Map ourselves as 1000:1000, since it costs nothing to mask the uid and gid.
+    uid_t fakeUid = 1000;
+    gid_t fakeGid = 1000;
+
+    if (devmode) {
+      // "Randomize" the UID and GID in dev mode. This catches app bugs where the app expects the
+      // UID or GID to be always 1000, which is not true of servers that use the privileged sandbox
+      // rather than the userns sandbox. (The "randomization" algorithm here is only meant to
+      // appear random to a human. The funny-looking numbers are just arbitrary primes chosen
+      // without much thought.)
+      time_t now = time(nullptr);
+      fakeUid = now * 4721 % 2000 + 1;
+      fakeGid = now * 2791 % 2000 + 1;
+    }
+
+    writeSetgroupsIfPresent("deny\n");
+    writeUserNSMap("uid", kj::str(fakeUid, " ", uid, " 1\n"));
+    writeUserNSMap("gid", kj::str(fakeGid, " ", gid, " 1\n"));
+  } else {
+    // Use root privileges instead of user namespaces.
+
+    // We need to raise our privileges to call unshare(), and to perform other setup that occurs
+    // after unshare().
+    KJ_SYSCALL(seteuid(0));
+
+    // Unshare all of the namespaces except network.  Note that unsharing the pid namespace is a
+    // little odd in that it doesn't actually affect this process, but affects later children
+    // created by it.
+    KJ_SYSCALL(unshare(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWPID));
+  }
 
   // To really unshare the mount namespace, we also have to make sure all mounts are private.
-  // The parameters here were derived by strace'ing `mount --make-rprivate /`.  AFAICT the flags
-  // are undocumented.  :(
+  // See the "SHARED SUBTREES" section of mount_namespaces(7) and the section "Changing the
+  // propagation type of an existing mount" in mount(2). Cliffsnotes version: MS_PRIVATE sets
+  // the "target" argument (in this case "/") to private, and MS_REC applies this recursively.
+  // All other arguments are ignored.
   KJ_SYSCALL(mount("none", "/", nullptr, MS_REC | MS_PRIVATE, nullptr));
 
   // Set a dummy host / domain so the grain can't see the real one.  (unshare(CLONE_NEWUTS) means
@@ -1048,7 +1135,18 @@ void SupervisorMain::setupSeccomp() {
      SCMP_A0(SCMP_CMP_EQ, AF_SECURITY)));
   CHECK_SECCOMP(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), SCMP_SYS(socket), 1,
      SCMP_A0(SCMP_CMP_EQ, AF_KEY)));
-#pragma GCC diagnostic pop
+
+  // Disallow DCCP sockets due to Linux CVE-2017-6074.
+  //
+  // The `type` parameter to `socket()` can have SOCK_NONBLOCK and SOCK_CLOEXEC bitwise-or'd in,
+  // so we need to mask those out for our check. The kernel defines a constant SOCK_TYPE_MASK
+  // as 0x0f, but this constant doesn't appear to be in the headers, so we specify by hand.
+  //
+  // TODO(security): We should probably disallow everything except SOCK_STREAM and SOCK_DGRAM but
+  //   I don't totally get how to write such conditionals with libseccomp. We should really dump
+  //   libseccomp and write in BPF assembly, which is frankly much easier to understand.
+  CHECK_SECCOMP(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPROTONOSUPPORT), SCMP_SYS(socket), 1,
+     SCMP_A1(SCMP_CMP_MASKED_EQ, 0x0f, SOCK_DCCP)));
 
   CHECK_SECCOMP(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(add_key), 0));
   CHECK_SECCOMP(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(request_key), 0));
@@ -1097,6 +1195,18 @@ void SupervisorMain::setupSeccomp() {
   // Utterly terrifying profiling operations
   CHECK_SECCOMP(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(perf_event_open), 0));
 
+  // Don't let apps specify their own seccomp filters, since seccomp filters are literally programs
+  // that run in-kernel (albeit with a very limited instruction set).
+  CHECK_SECCOMP(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EINVAL), SCMP_SYS(prctl), 1,
+      SCMP_A0(SCMP_CMP_EQ, PR_SET_SECCOMP)));
+  CHECK_SECCOMP(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(seccomp), 0));
+  CHECK_SECCOMP(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(bpf), 0));
+
+  // New syscalls that don't seem useful to Sandstorm apps therefore we will disallow them.
+  // TODO(cleanup): Can we somehow specify "disallow all calls greater than N" to preemptively
+  //   disable things until we've reviewed them?
+  CHECK_SECCOMP(seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(userfaultfd), 0));
+
   // TOOD(someday): See if we can get away with turning off mincore, madvise, sysinfo etc.
 
   // TODO(someday): Turn off POSIX message queues and other such esoteric features.
@@ -1107,6 +1217,7 @@ void SupervisorMain::setupSeccomp() {
 
   CHECK_SECCOMP(seccomp_load(ctx));
 
+#pragma GCC diagnostic pop
 #undef CHECK_SECCOMP
 }
 
@@ -1137,253 +1248,6 @@ void SupervisorMain::unshareNetwork() {
     ifr.ifr_ifru.ifru_flags = IFF_LOOPBACK | IFF_UP | IFF_RUNNING;
     KJ_SYSCALL(ioctl(fd, SIOCSIFFLAGS, &ifr));
   }
-
-  // Check if iptables module is available, skip the rest if not.
-  if (!isIpTablesAvailable) {
-    KJ_LOG(WARNING,
-        "ip_tables kernel module not loaded; cannot set up transparent network forwarding.");
-    return;
-  }
-
-  // Create a fake network interface "dummy0" of type "dummy". We need this only so that we can
-  // route packets to it which we can in turn filter with iptables.
-  {
-    int netlink;
-    KJ_SYSCALL(netlink = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE));
-    KJ_DEFER(close(netlink));
-
-    socklen_t bufsize = 32768;
-    KJ_SYSCALL(setsockopt(netlink, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)));
-    bufsize = 1048576;
-    KJ_SYSCALL(setsockopt(netlink, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)));
-
-    StructyMessage message(4);
-
-    auto header = message.add<struct nlmsghdr>();
-
-    header->nlmsg_type = RTM_NEWLINK;
-    header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
-
-    message.add<struct ifinfomsg>();  // leave zero'd
-
-    auto ifnameAttr = message.add<struct rtattr>();
-    ifnameAttr->rta_len = sizeof(struct rtattr) + sizeof("dummy0");
-    ifnameAttr->rta_type = IFLA_IFNAME;
-    message.addString("dummy0");
-
-    auto portAttr = message.add<struct rtattr>();
-    portAttr->rta_type = IFLA_LINKINFO;
-
-    // We're cargo-culting a bit here. IFLA_LINKINFO is not documented but it looks kind of
-    // like an rtattr. For some reason the string value is not NUL-terminated, though.
-    auto typeAttr = message.add<struct rtattr>();
-    typeAttr->rta_type = IFLA_INFO_KIND;  // Looks like it might be the right constant?
-    typeAttr->rta_len = sizeof(struct rtattr) + strlen("dummy");
-    message.addBytes("dummy", strlen("dummy"));
-
-    portAttr->rta_len = offsetBetween(portAttr, message.end());
-
-    header->nlmsg_len = offsetBetween(header, message.end());
-
-    struct msghdr socketMsg;
-    memset(&socketMsg, 0, sizeof(socketMsg));
-
-    struct sockaddr_nl netlinkAddr;
-    memset(&netlinkAddr, 0, sizeof(netlinkAddr));
-    netlinkAddr.nl_family = AF_NETLINK;
-    socketMsg.msg_name = &netlinkAddr;
-    socketMsg.msg_namelen = sizeof(netlinkAddr);
-
-    struct iovec iov;
-    iov.iov_base = message.begin();
-    iov.iov_len = message.size();
-    socketMsg.msg_iov = &iov;
-    socketMsg.msg_iovlen = 1;
-
-    KJ_SYSCALL(sendmsg(netlink, &socketMsg, 0));
-
-    struct {
-      struct nlmsghdr header;
-      struct nlmsgerr error;
-      char buffer[512];
-    } result;
-    iov.iov_base = &result;
-    iov.iov_len = sizeof(result);
-
-    KJ_SYSCALL(recvmsg(netlink, &socketMsg, 0));
-
-    KJ_ASSERT(result.header.nlmsg_type == NLMSG_ERROR);
-    KJ_ASSERT(result.header.nlmsg_seq == 0);
-    if (result.error.error != 0) {
-      KJ_FAIL_SYSCALL("netlink(ip link add dummy0 type dummy)", -result.error.error);
-    }
-  }
-
-  // Bring up dummy0.
-  {
-    // Set the address of "dummy0".
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    strcpy(ifr.ifr_ifrn.ifrn_name, "dummy0");
-    struct sockaddr_in* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_ifru.ifru_addr);
-    addr->sin_family = AF_INET;
-    addr->sin_addr.s_addr = htonl(0xc0a8fa02);  // 192.168.250.2
-    KJ_SYSCALL(ioctl(fd, SIOCSIFADDR, &ifr));
-
-    // Set flags to enable "dummy0".
-    memset(&ifr.ifr_ifru, 0, sizeof(ifr.ifr_ifru));
-    ifr.ifr_ifru.ifru_flags = IFF_UP | IFF_RUNNING;
-    KJ_SYSCALL(ioctl(fd, SIOCSIFFLAGS, &ifr));
-  }
-
-  // Route external addresses through the "dummy0" interface, so that our iptables trick works.
-  {
-    struct rtentry route;
-    memset(&route, 0, sizeof(route));
-    route.rt_flags = RTF_UP | RTF_GATEWAY;
-    route.rt_dst.sa_family = AF_INET;
-    route.rt_gateway.sa_family = AF_INET;
-    reinterpret_cast<struct sockaddr_in*>(&route.rt_gateway)->sin_addr.s_addr =
-        htonl(0xc0a8fa01);  // 192.168.250.1; any address in 192.168.250.x would work here
-
-    KJ_SYSCALL(ioctl(fd, SIOCADDRT, &route));
-  }
-
-  // Set up iptables to redirect all non-local traffic to 127.0.0.1:23136.
-  //
-  // This should be equivalent-ish to:
-  //   iptables -t nat -A OUTPUT -p tcp -j DNAT --to 127.0.0.1:23136
-  //   iptables -t nat -A OUTPUT -p udp -j DNAT --to 127.0.0.1:23136
-  {
-    // Get the existing iptables info, needed in order to properly fill out the update request.
-    struct ipt_getinfo info;
-    memset(&info, 0, sizeof(info));
-    strcpy(info.name, "nat");
-    socklen_t optsize = sizeof(info);
-    KJ_SYSCALL(getsockopt(fd, IPPROTO_IP, IPT_SO_GET_INFO, &info, &optsize));
-
-    // Linux kernel interfaces like to be designed as a packed list of structs of varying types,
-    // kind of like SBE but uglier. Ugh.
-    StructyMessage message;
-
-    // Create a replace message.
-    auto replace = message.add<struct ipt_replace>();
-    strcpy(replace->name, "nat");
-    replace->valid_hooks = info.valid_hooks;
-
-    // The kernel insists that we give it a place to write out the counters on the existing
-    // table entries. Of course, they should all be zero, and we don't care either way. But we
-    // have to give it space.
-    struct xt_counters oldCounters[info.num_entries];
-    memset(oldCounters, 0, sizeof(oldCounters));
-    replace->num_counters = info.num_entries;
-    replace->counters = oldCounters;
-
-    // Create an entry which accepts all packets destined for 127.0.0.0/8.
-    ++replace->num_entries;
-    auto acceptLocal = message.add<struct ipt_entry>();
-    acceptLocal->ip.dst.s_addr = htonl(0x7F000000);   // ip   127.0.0.0
-    acceptLocal->ip.dmsk.s_addr = htonl(0xFF000000);  // mask 255.0.0.0
-    auto acceptLocalTarget = message.add<struct ipt_entry_target>();
-    *message.add<int>() = -1 - NF_ACCEPT;
-    acceptLocalTarget->u.target_size = offsetBetween(acceptLocalTarget, message.end());
-    acceptLocal->target_offset = offsetBetween(acceptLocal, acceptLocalTarget);
-    acceptLocal->next_offset = offsetBetween(acceptLocal, message.end());
-
-    // Create an entry which forwards all TCP packets to a local port.
-    ++replace->num_entries;
-    auto dnatTcp = message.add<struct ipt_entry>();
-    dnatTcp->ip.proto = IPPROTO_TCP;
-    auto dnatTcpTarget = message.add<struct ipt_entry_target>();
-    auto dnatTcpRange = message.add<struct nf_nat_ipv4_multi_range_compat>();
-    dnatTcpRange->rangesize = 1;
-    dnatTcpRange->range[0].flags = NF_NAT_RANGE_PROTO_SPECIFIED | NF_NAT_RANGE_MAP_IPS;
-    dnatTcpRange->range[0].min_ip = htonl(0x7F000001);  // 127.0.0.1
-    dnatTcpRange->range[0].max_ip = htonl(0x7F000001);  // 127.0.0.1
-    dnatTcpRange->range[0].min.tcp.port = htons(23136);
-    dnatTcpRange->range[0].max.tcp.port = htons(23136);
-    dnatTcpTarget->u.user.target_size = offsetBetween(dnatTcpTarget, message.end());
-    strcpy(dnatTcpTarget->u.user.name, "DNAT");
-    dnatTcp->target_offset = offsetBetween(dnatTcp, dnatTcpTarget);
-    dnatTcp->next_offset = offsetBetween(dnatTcp, message.end());
-
-    // Create an entry which forwards all UDP packets to a local port.
-    ++replace->num_entries;
-    auto dnatUdp = message.add<struct ipt_entry>();
-    dnatUdp->ip.proto = IPPROTO_UDP;
-    auto dnatUdpTarget = message.add<struct ipt_entry_target>();
-    auto dnatUdpRange = message.add<struct nf_nat_ipv4_multi_range_compat>();
-    dnatUdpRange->rangesize = 1;
-    dnatUdpRange->range[0].flags = NF_NAT_RANGE_PROTO_SPECIFIED | NF_NAT_RANGE_MAP_IPS;
-    dnatUdpRange->range[0].min_ip = htonl(0x7F000001);  // 127.0.0.1
-    dnatUdpRange->range[0].max_ip = htonl(0x7F000001);  // 127.0.0.1
-    dnatUdpRange->range[0].min.udp.port = htons(23136);
-    dnatUdpRange->range[0].max.udp.port = htons(23136);
-    dnatUdpTarget->u.user.target_size = offsetBetween(dnatUdpTarget, message.end());
-    strcpy(dnatUdpTarget->u.user.name, "DNAT");
-    dnatUdp->target_offset = offsetBetween(dnatUdp, dnatUdpTarget);
-    dnatUdp->next_offset = offsetBetween(dnatUdp, message.end());
-
-    // Create an entry which accepts everything.
-    ++replace->num_entries;
-    auto acceptAll = message.add<struct ipt_entry>();
-    auto acceptAllTarget = message.add<struct ipt_entry_target>();
-    *message.add<int>() = -1 - NF_ACCEPT;
-    acceptAllTarget->u.target_size = offsetBetween(acceptAllTarget, message.end());
-    acceptAll->target_offset = offsetBetween(acceptAll, acceptAllTarget);
-    acceptAll->next_offset = offsetBetween(acceptAll, message.end());
-
-    // Cap it off with an error entry.
-    ++replace->num_entries;
-    auto error = message.add<struct ipt_entry>();
-    auto errorTarget = message.add<struct xt_error_target>();
-    errorTarget->target.u.user.target_size = offsetBetween(errorTarget, message.end());
-    strcpy(errorTarget->target.u.user.name, "ERROR");
-    strcpy(errorTarget->errorname, "ERROR");
-    error->target_offset = offsetBetween(error, errorTarget);
-    error->next_offset = offsetBetween(error, message.end());
-
-    replace->hook_entry[NF_INET_PRE_ROUTING] = offsetBetween(replace->entries, acceptAll);
-    replace->hook_entry[NF_INET_LOCAL_IN] = offsetBetween(replace->entries, acceptAll);
-    replace->hook_entry[NF_INET_FORWARD] = offsetBetween(replace->entries, acceptAll);
-    replace->hook_entry[NF_INET_LOCAL_OUT] = offsetBetween(replace->entries, acceptLocal);
-    replace->hook_entry[NF_INET_POST_ROUTING] = offsetBetween(replace->entries, acceptAll);
-
-    replace->underflow[NF_INET_PRE_ROUTING] = offsetBetween(replace->entries, acceptAll);
-    replace->underflow[NF_INET_LOCAL_IN] = offsetBetween(replace->entries, acceptAll);
-    replace->underflow[NF_INET_FORWARD] = offsetBetween(replace->entries, acceptAll);
-    replace->underflow[NF_INET_LOCAL_OUT] = offsetBetween(replace->entries, acceptAll);
-    replace->underflow[NF_INET_POST_ROUTING] = offsetBetween(replace->entries, acceptAll);
-
-    replace->size = offsetBetween(replace->entries, message.end());
-
-    KJ_SYSCALL(setsockopt(fd, IPPROTO_IP, IPT_SO_SET_REPLACE, message.begin(), message.size()));
-  }
-}
-
-bool SupervisorMain::checkIfIpTablesLoaded() {
-  // Detect if the iptables kernel module is available. Must be called before entering the
-  // sandbox since this requires /proc.
-  //
-  // TODO(soon): This check is wrong because iptables could be compiled directly into the kernel
-  //   rather than as a module. Indeed, /proc/modules is reported to be sometimes absent in the
-  //   wild, perhaps when the kernel is compiled without module support. For now we'll assume
-  //   iptables is unavailable in that case.
-
-  KJ_IF_MAYBE(procModules, raiiOpenIfExists("/proc/modules", O_RDONLY)) {
-    kj::FdInputStream rawIn(kj::mv(*procModules));
-    kj::BufferedInputStreamWrapper bufferedIn(rawIn);
-
-    for (;;) {
-      KJ_IF_MAYBE(line, readLine(bufferedIn)) {
-        if (line->startsWith("ip_tables ")) return true;
-      } else {
-        break;
-      }
-    }
-  }
-
-  return false;
 }
 
 void SupervisorMain::maybeFinishMountingProc() {
@@ -1408,18 +1272,23 @@ void SupervisorMain::maybeFinishMountingProc() {
 }
 
 void SupervisorMain::permanentlyDropSuperuser() {
-  // Drop all Linux "capabilities".  (These are Linux/POSIX "capabilities", which are not true
-  // object-capabilities, hence the quotes.)
-  //
-  // This unfortunately must be performed post-fork (in both parent and child), because the child
-  // needs to do one final unshare().
+  KJ_IF_MAYBE(ruid, sandboxUid) {
+    // setuid() to non-zero implicitly drops capabilities.
+    KJ_SYSCALL(setresuid(*ruid, *ruid, *ruid));
+  } else {
+    // Drop all Linux "capabilities".  (These are Linux/POSIX "capabilities", which are not true
+    // object-capabilities, hence the quotes.)
+    //
+    // This unfortunately must be performed post-fork (in both parent and child), because the child
+    // needs to do one final unshare().
 
-  struct __user_cap_header_struct hdr;
-  struct __user_cap_data_struct data[2];
-  hdr.version = _LINUX_CAPABILITY_VERSION_3;
-  hdr.pid = 0;
-  memset(data, 0, sizeof(data));  // All capabilities disabled!
-  KJ_SYSCALL(capset(&hdr, data));
+    struct __user_cap_header_struct hdr;
+    struct __user_cap_data_struct data[2];
+    hdr.version = _LINUX_CAPABILITY_VERSION_3;
+    hdr.pid = 0;
+    memset(data, 0, sizeof(data));  // All capabilities disabled!
+    KJ_SYSCALL(capset(&hdr, data));
+  }
 
   // Sandstorm data is private.  Don't let other users see it.  But, do grant full access to the
   // group.  The idea here is that you might have a dedicated sandstorm-sandbox user account but
@@ -1504,11 +1373,13 @@ void SupervisorMain::DefaultSystemConnector::checkIfAlreadyRunning() const {
 [[noreturn]] void SupervisorMain::runChild(int apiFd, kj::AutoCloseFd startEventFd) {
   // We are the child.
 
-  // Wait until we get the signal to start.
+  enterSandbox();
+
+  // Wait until we get the signal to start. (It's important to do this after entering the sandbox
+  // so that the parent process has permission to send SIGKILL to the child even in
+  // privileged-mode.)
   uint64_t dummy;
   KJ_SYSCALL(read(startEventFd, &dummy, sizeof(dummy)));
-
-  enterSandbox();
 
   // Reset all signal handlers to default.  (exec() will leave ignored signals ignored, and KJ
   // code likes to ignore e.g. SIGPIPE.)
@@ -1562,7 +1433,7 @@ public:
   SaveWrapper(AppPersistent<>::Client&& cap, capnp::List<MembraneRequirement>::Reader _requirements,
               capnp::Data::Reader parentToken, SandstormCore::Client sandstormCore)
       : cap(kj::mv(cap)), parentToken(kj::heapArray<const byte>(parentToken)),
-        sandstormCore(sandstormCore) {
+        sandstormCore(kj::mv(sandstormCore)) {
     builder.setRoot(kj::mv(_requirements));
     requirements = builder.getRoot<capnp::List<MembraneRequirement>>().asReader();
   }
@@ -1589,7 +1460,7 @@ public:
     req.setParent(parentToken);
     req.setOwner(owner);
     req.setRequirements(requirements);
-    return req.send().then([context](auto args) mutable {
+    return req.send().then([context](auto args) mutable -> void {
       context.getResults().setSturdyRef(args.getToken());
     });
   }
@@ -1622,7 +1493,7 @@ public:
       req.getRef().setAppRef(response.getObjectId());
       req.setOwner(owner);
       // TODO(someday): Set requirements. This will require membranes to work properly.
-      return req.send().then([context](auto response) mutable {
+      return req.send().then([context](auto response) mutable -> void {
         context.getResults().setSturdyRef(response.getToken());
       });
      });
@@ -1684,11 +1555,11 @@ public:
 
     kj::Promise<void> cancel(CancelContext context) override {
       cancel();
-      return ongoingNotification.cancelRequest().send().then([](auto args) {});
+      return ongoingNotification.cancelRequest().send().ignoreResult();
     }
 
     kj::Promise<void> save(SaveContext context) override {
-      return wakelockSet.save(ongoingNotification).then([context] (auto args) mutable {
+      return wakelockSet.save(ongoingNotification).then([context] (auto args) mutable -> void {
         context.getResults().setSturdyRef(args.getToken());
       });
     }
@@ -1768,11 +1639,12 @@ public:
 
   kj::Promise<void> save(SaveContext context) override {
     auto args = context.getParams();
+    KJ_REQUIRE(args.hasCap(), "Cannot save a null capability.");
     auto req = args.getCap().template castAs<SystemPersistent>().saveRequest();
     auto grainOwner = req.getSealFor().initGrain();
     grainOwner.setGrainId(grainId);
     grainOwner.setSaveLabel(args.getLabel());
-    return req.send().then([this, context](auto args) mutable {
+    return req.send().then([this, context](auto args) mutable -> void {
       context.getResults().setToken(args.getSturdyRef());
     });
   }
@@ -1780,8 +1652,7 @@ public:
   kj::Promise<void> restore(RestoreContext context) override {
     auto req = sandstormCore.restoreRequest();
     req.setToken(context.getParams().getToken());
-    req.setRequiredPermissions(context.getParams().getRequiredPermissions());
-    return req.send().then([context](auto args) mutable {
+    return req.send().then([context](auto args) mutable -> void {
       context.getResults().setCap(args.getCap());
     });
   }
@@ -1789,7 +1660,7 @@ public:
   kj::Promise<void> drop(DropContext context) override {
     auto req = sandstormCore.dropRequest();
     req.setToken(context.getParams().getToken());
-    return req.send().then([](auto args) {});
+    return req.send().ignoreResult();
   }
 
 //  kj::Promise<void> deleted(DeletedContext context) override {
@@ -1840,10 +1711,28 @@ public:
       auto grainOwner = req.getSealFor().initGrain();
       grainOwner.setGrainId(grainId);
       grainOwner.getSaveLabel().setDefaultText("ongoing notification handle");
-      return req.send().then([this, context](auto args) mutable {
+      return req.send().then([this, context](auto args) mutable -> void {
         SANDSTORM_LOG("Grain has enabled backgrounding.");
         context.getResults().setHandle(kj::heap<WakelockHandle>(args.getSturdyRef(), *this));
       });
+    });
+  }
+
+  kj::Promise<void> backgroundActivity(BackgroundActivityContext context) override {
+    auto params = context.getParams();
+    auto req = sandstormCore.backgroundActivityRequest(params.totalSize());
+    req.setEvent(params.getEvent());
+    context.releaseParams();
+    return req.send().ignoreResult();
+  }
+
+  kj::Promise<void> getIdentityId(GetIdentityIdContext context) override {
+    auto params = context.getParams();
+    auto req = sandstormCore.getIdentityIdRequest(params.totalSize());
+    req.setIdentity(params.getIdentity());
+    context.releaseParams();
+    return req.send().then([context](auto args) mutable -> void {
+      context.getResults().setId(args.getId());
     });
   }
 
@@ -1853,7 +1742,7 @@ private:
     req.setToken(sturdyRef);
     // TODO(someday): Handle failures for drop? Currently, if the the frontend never drops the
     // notification or calls cancel on it, then this handle will essentially leak.
-    tasks.add(req.send().then([](auto args) {}));
+    tasks.add(req.send().ignoreResult());
   }
 
   void taskFailed(kj::Exception&& exception) override {
@@ -1884,11 +1773,11 @@ private:
 class SupervisorMain::SupervisorImpl final: public Supervisor::Server {
 public:
   inline SupervisorImpl(kj::UnixEventPort& eventPort, MainView<>::Client&& mainView,
-                        DiskUsageWatcher& diskWatcher, WakelockSet& wakelockSet,
-                        kj::AutoCloseFd startAppEvent, SandstormCore::Client& sandstormCore)
-      : eventPort(eventPort), mainView(kj::mv(mainView)), diskWatcher(diskWatcher),
+                        WakelockSet& wakelockSet, kj::AutoCloseFd startAppEvent,
+                        SandstormCore::Client sandstormCore, kj::Own<CapRedirector> coreRedirector)
+      : eventPort(eventPort), mainView(kj::mv(mainView)),
         wakelockSet(wakelockSet), sandstormCore(sandstormCore),
-        startAppEvent(kj::mv(startAppEvent)) {}
+        coreRedirector(kj::mv(coreRedirector)), startAppEvent(kj::mv(startAppEvent)) {}
 
   kj::Promise<void> getMainView(GetMainViewContext context) override {
     ensureStarted();
@@ -1898,6 +1787,12 @@ public:
 
   kj::Promise<void> keepAlive(KeepAliveContext context) override {
     sandstorm::keepAlive = true;
+
+    auto params = context.getParams();
+    if (params.hasCore()) {
+      coreRedirector->setTarget(params.getCore());
+    }
+
     return kj::READY_NOW;
   }
 
@@ -1908,20 +1803,8 @@ public:
   }
 
   kj::Promise<void> shutdown(ShutdownContext context) override {
+    SANDSTORM_LOG("Grain shutdown requested.");
     killChildAndExit(0);
-  }
-
-  kj::Promise<void> getGrainSize(GetGrainSizeContext context) override {
-    context.getResults(capnp::MessageSize { 2, 0 }).setSize(diskWatcher.getSize());
-    return kj::READY_NOW;
-  }
-
-  kj::Promise<void> getGrainSizeWhenDifferent(GetGrainSizeWhenDifferentContext context) override {
-    auto oldSize = context.getParams().getOldSize();
-    context.releaseParams();
-    return diskWatcher.getSizeWhenChanged(oldSize).then([context](uint64_t size) mutable {
-      context.getResults(capnp::MessageSize { 2, 0 }).setSize(size);
-    });
   }
 
   kj::Promise<void> watchLog(WatchLogContext context) override {
@@ -1931,11 +1814,34 @@ public:
     // Seek to desired start point.
     struct stat stats;
     KJ_SYSCALL(fstat(logFile, &stats));
-    uint64_t backlog = kj::min(params.getBacklogAmount(), stats.st_size);
+    uint64_t requestedBacklog = params.getBacklogAmount();
+    uint64_t backlog = kj::min(requestedBacklog, stats.st_size);
     KJ_SYSCALL(lseek(logFile, stats.st_size - backlog, SEEK_SET));
+
+    // If the existing log file doesn't cover the whole request, check the previous log file.
+    kj::Maybe<kj::Promise<void>> firstWrite;
+    if (stats.st_size < requestedBacklog) {
+      KJ_IF_MAYBE(log1, raiiOpenIfExists("log.1", O_RDONLY)) {
+        struct stat stats1;
+        KJ_SYSCALL(fstat(*log1, &stats1));
+        uint64_t requestedBacklog1 = requestedBacklog - stats.st_size;
+        uint64_t backlog1 = kj::min(requestedBacklog1, stats1.st_size);
+        KJ_SYSCALL(lseek(*log1, stats1.st_size - backlog1, SEEK_SET));
+
+        kj::FdInputStream in(log1->get());
+        auto req = params.getStream().writeRequest();
+        auto data = req.initData(backlog1);
+        in.read(data.begin(), backlog1);
+        firstWrite = req.send().ignoreResult();
+      }
+    }
 
     // Create the watcher.
     auto watcher = kj::heap<LogWatcher>(eventPort, "log", kj::mv(logFile), params.getStream());
+
+    KJ_IF_MAYBE(f, firstWrite) {
+      watcher->addTask(kj::mv(*f));
+    }
 
     context.releaseParams();
     context.getResults(capnp::MessageSize { 4, 1 }).setHandle(kj::mv(watcher));
@@ -1956,7 +1862,7 @@ public:
       case SupervisorObjectId<>::APP_REF: {
         auto req = mainView.restoreRequest();
         req.setObjectId(objectId.getAppRef());
-        return req.send().then([this, params, context](auto args) mutable {
+        return req.send().then([this, params, context](auto args) mutable -> void {
           context.getResults().setCap(kj::heap<SaveWrapper>(
             args.getCap().template castAs<AppPersistent<>>(), params.getRequirements(), params.getParentToken(), sandstormCore));
         });
@@ -1979,6 +1885,8 @@ public:
   }
 
   kj::Promise<void> getWwwFileHack(GetWwwFileHackContext context) override {
+    context.allowCancellation();
+
     auto params = context.getParams();
     auto path = params.getPath();
 
@@ -2009,7 +1917,7 @@ public:
         req.setSize(stats.st_size);
         auto expectSizeTask = req.send();
         auto inStream = kj::heap<kj::FdInputStream>(kj::mv(*fd));
-        return pump(*inStream, kj::mv(stream)).attach(kj::mv(inStream));
+        return pump(*inStream, kj::mv(stream)).attach(kj::mv(inStream), kj::mv(expectSizeTask));
       } else if (S_ISDIR(stats.st_mode)) {
         context.getResults(capnp::MessageSize {4, 0})
             .setStatus(Supervisor::WwwFileStatus::DIRECTORY);
@@ -2027,9 +1935,9 @@ public:
 private:
   kj::UnixEventPort& eventPort;
   MainView<>::Client mainView;
-  DiskUsageWatcher& diskWatcher;
   WakelockSet& wakelockSet;
   SandstormCore::Client sandstormCore;
+  kj::Own<CapRedirector> coreRedirector;
   kj::AutoCloseFd startAppEvent;
 
   void ensureStarted() {
@@ -2056,12 +1964,18 @@ private:
       tasks.add(watchLoop());
     }
 
+    void addTask(kj::Promise<void> task) {
+      // HACK for watchLog().
+      tasks.add(kj::mv(task));
+    }
+
   private:
     kj::AutoCloseFd logFile;
     kj::AutoCloseFd inotify;
     kj::UnixEventPort::FdObserver inotifyObserver;
     ByteStream::Client stream;
     kj::TaskSet tasks;
+    off_t lastOffset = 0;
 
     void taskFailed(kj::Exception&& exception) override {
       KJ_LOG(ERROR, exception);
@@ -2077,6 +1991,15 @@ private:
         KJ_NONBLOCKING_SYSCALL(n = read(inotify, buffer, sizeof(buffer)));
         if (n < 0) break;
         KJ_ASSERT(n > 0);
+      }
+
+      // Check for recent rotation.
+      struct stat stats;
+      KJ_SYSCALL(fstat(logFile, &stats));
+      if (lastOffset > stats.st_size) {
+        // Looks like log was rotated.
+        lastOffset = 0;
+        KJ_SYSCALL(lseek(logFile, 0, SEEK_SET));
       }
 
       // Read all unread data from logFile and send it to the stream.
@@ -2096,10 +2019,12 @@ private:
         }
         req.adoptData(kj::mv(orphan));
 
-        tasks.add(req.send().then([](auto) {}));
+        tasks.add(req.send().ignoreResult());
 
         if (done) break;
       }
+
+      KJ_SYSCALL(lastOffset = lseek(logFile, 0, SEEK_CUR));
 
       // OK, now wait for more.
       return inotifyObserver.whenBecomesReadable().then([this]() {
@@ -2126,26 +2051,14 @@ public:
   }
 };
 
-struct SupervisorMain::DefaultSystemConnector::AcceptedConnection {
-  kj::Own<kj::AsyncIoStream> connection;
-  capnp::TwoPartyVatNetwork network;
-  capnp::RpcSystem<capnp::rpc::twoparty::VatId> rpcSystem;
-
-  explicit AcceptedConnection(capnp::Capability::Client bootstrapInterface,
-                              kj::Own<kj::AsyncIoStream>&& connectionParam)
-      : connection(kj::mv(connectionParam)),
-        network(*connection, capnp::rpc::twoparty::Side::SERVER),
-        rpcSystem(capnp::makeRpcServer(network, kj::mv(bootstrapInterface))) {}
-};
-
-auto SupervisorMain::DefaultSystemConnector::run(
-    kj::AsyncIoContext& ioContext, Supervisor::Client mainCap) const
-    -> SystemConnector::RunResult {
-  auto listener = kj::heap<TwoPartyServerWithClientBootstrap>(kj::mv(mainCap));
-  auto core = listener->getBootstrap().castAs<SandstormCore>();
+kj::Promise<void> SupervisorMain::DefaultSystemConnector::run(
+    kj::AsyncIoContext& ioContext, Supervisor::Client mainCap,
+    kj::Own<CapRedirector> coreRedirector) const {
+  auto listener = kj::heap<TwoPartyServerWithClientBootstrap>(
+      kj::mv(mainCap), kj::mv(coreRedirector));
 
   unlink("socket");  // Clear stale socket, if any.
-  auto acceptTask = ioContext.provider->getNetwork().parseAddress("unix:socket", 0).then(
+  return ioContext.provider->getNetwork().parseAddress("unix:socket", 0).then(
       [KJ_MVCAP(listener)](kj::Own<kj::NetworkAddress>&& addr) mutable {
     auto serverPort = addr->listen();
 
@@ -2155,8 +2068,6 @@ auto SupervisorMain::DefaultSystemConnector::run(
     auto promise = listener->listen(kj::mv(serverPort));
     return promise.attach(kj::mv(listener));
   });
-
-  return { kj::mv(acceptTask), kj::mv(core) };
 }
 
 // -----------------------------------------------------------------------------
@@ -2205,8 +2116,9 @@ auto SupervisorMain::DefaultSystemConnector::run(
   SandstormCore::Client coreCap = static_cast<capnp::Capability::Client>(
     kj::addRef(*coreRedirector)).castAs<SandstormCore>();
   SupervisorRealmGateway::Client gateway = kj::heap<SupervisorRealmGatewayImpl>(coreCap);
+
   // Compute grain size and watch for changes.
-  DiskUsageWatcher diskWatcher(ioContext.unixEventPort);
+  DiskUsageWatcher diskWatcher(ioContext.unixEventPort, ioContext.provider->getTimer(), coreCap);
   auto diskWatcherTask = diskWatcher.init();
 
   // Set up the RPC connection to the app and export the supervisor interface.
@@ -2217,6 +2129,10 @@ auto SupervisorMain::DefaultSystemConnector::run(
   WakelockSet wakelockSet(grainId, coreCap);
   auto server = capnp::makeRpcServer(appNetwork, kj::heap<SandstormApiImpl>(wakelockSet, grainId,
       coreCap), kj::mv(gateway));
+
+  // Limit outstanding calls from the app to 1MiW (8MiB) in order to prevent an errant or malicious
+  // app from consuming excessive RAM elsewhere in the system.
+  server.setFlowLimit(1u << 20);
 
   // Get the app's UiView by restoring a null SturdyRef from it.
   capnp::MallocMessageBuilder message;
@@ -2229,15 +2145,17 @@ auto SupervisorMain::DefaultSystemConnector::run(
   //   want to wrap the UiView and cache session objects.  Perhaps we could do this by making
   //   them persistable, though it's unclear how that would work with SessionContext.
   Supervisor::Client mainCap = kj::heap<SupervisorImpl>(
-      ioContext.unixEventPort, kj::mv(app), diskWatcher, wakelockSet, kj::mv(startEventFd), coreCap);
+      ioContext.unixEventPort, kj::mv(app), wakelockSet, kj::mv(startEventFd),
+      coreCap, kj::addRef(*coreRedirector));
 
-  auto runner = systemConnector->run(ioContext, kj::mv(mainCap));
-  auto acceptTask = kj::mv(runner.task);
-  coreRedirector->setTarget(runner.sandstormCore);
+  auto acceptTask = systemConnector->run(ioContext, kj::mv(mainCap), kj::mv(coreRedirector));
 
-  // Wait for disconnect or accept loop failure or disk watch failure, then exit.
+  // Wait for disconnect or accept loop failure or disk watch failure, then exit. Also rotate log
+  // every 512k (thus having at most 1MB of logs at a time).
   acceptTask.exclusiveJoin(kj::mv(diskWatcherTask))
             .exclusiveJoin(appNetwork.onDisconnect())
+            .exclusiveJoin(rotateLog(ioContext.provider->getTimer(),
+                                     STDERR_FILENO, "log", 512u << 10))
             .wait(ioContext.waitScope);
 
   // Only onDisconnect() would return normally (rather than throw), so the app must have

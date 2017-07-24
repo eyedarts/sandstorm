@@ -1,16 +1,104 @@
-# App publishing guide
-
 After you've completed developing and testing your app's package for Sandstorm, you can publish it in the [Sandstorm App Market](https://apps.sandstorm.io/).
+
+## Get feedback on your app
+
+Before publishing an app to the Sandstorm app market, we recommend you
+email the [Sandstorm development email
+list](https://groups.google.com/forum/#!forum/sandstorm-dev) with a
+link to your package, to get feedback. Consider creating a
+[FileDrop](https://apps.sandstorm.io/app/nn7axgy3y8kvd0m1mtk3cwca34t916p5d7m4j1j2e874nuz3t8y0)
+grain containing your SPK file.
+
+The [app testing guide](https://github.com/sandstorm-io/sandstorm/wiki/Testing) provides
+some guidelines for what to look for while testing.
+
+## Double-check your app ID
+
+Sandstorm identifies every app by a [public
+key](http://ed25519.cr.yp.to/) authorized to sign updates for that
+app. The public key corresponds to a **private key** stored on your
+computer in `~/.sandstorm/sandstorm-keyring`.
+
+You can find the app ID for your app in your
+`sandstorm-pkgdef.capnp`. It will have a line like:
+
+```bash
+  id = "vfnwptfn02ty21w715snyyczw0nqxkv3jvawcah10c6z7hj1hnu0",
+  # Your app ID is actually its public key. The private key was placed in
+  # your keyring. All updates must be signed with the same key.
+```
+
+It's ***essential*** that you control this key! If you think someone
+else might have the key material for your app, now is a good time to
+change it.
+
+To find out if you have the key material, you can run:
+
+```bash
+$ vagrant-spk vm ssh
+$ spk listkeys -k ~/.sandstorm/sandstorm-keyring
+```
+
+You should see the app ID in the output.
+
+If you want to change the app ID before publishing the app, you
+can run:
+
+```bash
+$ vagrant-spk vm ssh
+$ spk keygen -k ~/.sandstorm/sandstorm-keyring
+```
+
+It will output a line like:
+
+```
+9qvtkns7m215pfc12jeyuunfj0wr5m6rwktw61vatdz22uva0qmh
+```
+
+which you can copy & paste into the `id = ...` line of
+`sandstorm-pkgdef.capnp`.
+
+**Technical notes:** `vagrant-spk` enables the above workflow because
+`~/.sandstorm` is shared into the Vagrant VM, so all keys are
+available from all packaging VMs. Note that `vagrant-spk` is optional;
+if you are using the raw `spk` packaging tool, note that you may have
+stored keys in `~/.sandstorm-keyring` instead of
+`~/.sandstorm/sandstorm-keyring`.  This key is an
+[Ed25519](http://ed25519.cr.yp.to/) key.
 
 ## Verify your identity
 
-Sandstorm packages are signed in two ways to ensure the authenticity of the package source. First, with a publicly-known Keybase key, which identifies the author. And second, by signing each app with unique ed25519 keys, ensuring that new versions of the app are from an appropriately authorized source.
+The next step is to prove that _you_ own the app ID, so that the
+[Sandstorm app market](https://apps.sandstorm.io/) can confidently
+list your contact details on your app's listing page.
+
+The process is that you will:
+
+* Create a standardized text file of the form: `I am the author of the Sandstorm.io app with the following ID: <app-id>`.
+
+* Use GPG to digitally sign the text.
+
+* Use Keybase.io to confirm a link between your GPG identity and your
+  Twitter, GitHub, personal website, or other social identities.
+
+Sandstorm uses the ***app ID key*** to permit updates to the next
+version of the app, and the app ID key is required.
+
+The GPG and Keybase integration affects how your name is presented
+when Sandstorm users try to find out who published the app. It is
+optional but highly recommended.
 
 ### Sign up with [Keybase.io](https://keybase.io)
 
-Currently, Keybase is invite-only. If you need an invite, you can contact [community@sandstorm.io](mailto:community@sandstorm.io). You should connect some of your public identites with your Keybase account, like Twitter and GitHub.
+Currently, Keybase is invite-only. If you need an invite, you can
+contact [community@sandstorm.io](mailto:community@sandstorm.io). You
+should connect some of your public identites with your Keybase
+account, like Twitter and GitHub.
 
-Sandstorm app authors are verified using a PGP key linked to Keybase. You should get the [prerequisites](https://keybase.io/docs/command_line/prerequisites) and follow [their directions](https://keybase.io/docs/command_line/installation) to get their software set up.
+Sandstorm app authors are verified using a PGP key linked to
+Keybase. You should follow [their
+directions](https://keybase.io/download) to get
+their software set up.
 
 ### Link your Sandstorm package with your Keybase key
 
@@ -27,7 +115,7 @@ If you do it correctly, `cat pgp-signature | gpg` should print out the statement
 
 To verify your signature, you also need to export your public key and include it in your app package. You can run the following command, where `<key-id>` is a PGP key ID or a username associated with the key:
 
-`gpg --export <key-id> > pgp-keyring`
+`gpg --export <key-id> --export-options export-minimal > pgp-keyring`
 
 ## Add required metadata
 
@@ -37,7 +125,9 @@ Your app's manifest, or package definition file, (`sandstorm-pkgdef.capnp`) cont
 
 #### icons
 
-You can embed both SVGs or PNGs, and Sandstorm will use the best version provided for the use in question.
+You can embed both SVGs or PNGs, and Sandstorm will use the best version provided for the use in question. Using PNGs requires a slightly different structure, which you can find an example of [here](https://github.com/dwrensha/sharelatex/blob/sandstorm-app/sandstorm-pkgdef.capnp#L26).
+
+![Screenshot of icons of various types and sizes](https://alpha-evgl4wnivwih0k6mzxt3.sandstorm.io/docs-package-icons.png)
 
 * The `appGrid` icon represents your app on the "New" screen on Sandstorm. It should be 128 x 128 pixels, and no larger than 64 KB.
 * The `grain` icon represents individual grains on both the navbar and the grain list. It should be 24 x 24 pixels, and no larger than 4 KB. If you omit this, the appGrid icon will be used.
@@ -66,7 +156,19 @@ You may also need to include `notices` if your app is required to display any th
 
 You may select the market categories to which your app belongs. You may select multiple, but you may be asked to make changes if the market moderators feel they are inappropriate.
 
-Currently, the following categories are accepted: productivity, communications, social, webPublishing, office, developerTools, science, graphics, media, games, and other.
+Currently, the following categories are accepted:
+
+* `productivity` is for apps you use to get organized, not the apps you use to produce content. (Examples: Note-taking apps, kanban boards, project management.)
+* `communications` is for apps you use to directly communicate with others. (Examples: Chat apps, email apps.)
+* `social` is for apps used for social networking, where content is shared and networks of people are managed.
+* `webPublishing` is for apps used for publishing websites and blogs.
+* `office` is for apps which are tools commonly used for office. (Examples: Word processors, spreadsheets, presentation apps.)
+* `developerTools` is for apps which are tools for software development. (Examples: Source control, test automation, compilers, IDEs.)
+* `science` is for apps used for scientific and academic pursuits. (Examples: Data gathering, data processing, paper publishing.)
+* `graphics` is for apps used to create graphics and artwork.
+* `media` is for apps used to consume media such as music, movies, and photos.
+* `games` is for apps that let you play games by yourself or with others.
+* `other` is for apps which fit into no other category. But you may wish to suggest we add a category if none currently applies.
 
 #### author
 
@@ -97,6 +199,11 @@ You can attach a number of screenshots here. You should specify the height and w
 Here you may embed a log of changes in GitHub-flavored Markdown. It is recommended to format this with a H1 heading for each release followed by a bullet list of changes. As an example, you can look at Etherpad's changelog [here](https://raw.githubusercontent.com/kentonv/etherpad-lite/sandstorm/CHANGELOG.md).
 
 ## Check your work
+
+Consider working through the [app testing
+guide](https://github.com/sandstorm-io/sandstorm/wiki/Testing) and/or
+emailing your app to the [sandstorm-dev email
+group](https://groups.google.com/forum/#!forum/sandstorm-dev).
 
 You can run `spk verify mypackage.spk` on your app package to see the details of your metadata. Ensure everything looks like it is supposed to before you publish your app.
 

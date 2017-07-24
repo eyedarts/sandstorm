@@ -18,7 +18,6 @@ limitations under the License.
 
 <head>
   <title>Sandstorm</title>
-  <script type="text/javascript" src="/logo.js"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
 
@@ -31,49 +30,59 @@ limitations under the License.
   {{#with demoExpired}}
     {{>title "Demo Expired"}}
 
-    <div id="demo-expired" class="main-content">
+    <div id="demo-expired" class="demo-expired-main-content {{#if hideNavbar}}hide-navbar{{else}}{{#if shrinkNavbar}}shrink-navbar{{/if}}{{/if}}">
       <h1>Demo Expired</h1>
       {{#if canUpgradeDemo}}
         <p>Thanks for trying the Sandstorm Demo! Your demo account has expired. If
           you'd like to continue using Sandstorm and make your data permanent, please sign in.</p>
         <div class="login">
-          {{> loginButtonsDialog globalAccountsUi}}
+          {{> loginButtonsDialog accountsUi=globalAccountsUi}}
         </div>
       {{else}}
-        <p>Thanks for trying the Sandstorm Demo! Your demo account has expired.</p>
-        <p><button class="logout">Sign out</button></p>
+        <p>Thanks for trying the Sandstorm Demo! Your demo account has expired.
+          <form class="standard-form">
+            <div class="button-row">
+              <button name="logout" type="submit">Sign out</button>
+            </div>
+          </form>
+        </p>
       {{/if}}
     </div>
   {{else}}
+  {{#if identityUser}}
+      {{> identityLoginInterstitial grains=globalGrains}}
+  {{else}}
+  {{#if isAccountSuspended}}
+    <div class="suspended-main-content {{#if hideNavbar}}hide-navbar{{else}}{{#if shrinkNavbar}}shrink-navbar{{/if}}{{/if}}">
+      {{> accountSuspended }}
+    </div>
+  {{else}}
   {{#if firstLogin}}
-    <div class="first-sign-in-main-content">
+    <div class="first-sign-in-main-content {{#if hideNavbar}}hide-navbar{{else}}{{#if shrinkNavbar}}shrink-navbar{{/if}}{{/if}}">
       {{> sandstormAccountsFirstSignIn accountSettingsUi}}
     </div>
   {{else}}
 
   {{!-- standard topbar items --}}
-  {{#if currentUser}}
-    {{#sandstormTopbarItem name="toggle-navbar" topbar=globalTopbar}}
-      <button class="toggle-navbar-button">Sandstorm</button>
-      {{/sandstormTopbarItem}}
+  {{#sandstormTopbarItem name="home-button" topbar=globalTopbar}}
+  <a href="/">{{effectiveServerTitle}}</a>
+  {{/sandstormTopbarItem}}
+  {{#if showAccountButtons}}
+    {{>sandstormTopbarItem name="account" topbar=globalTopbar data=accountButtonsData
+                           template="accountButtons" popupTemplate="accountButtonsPopup"}}
   {{else}}
-    {{!-- if the user is not logged in, we will not show the navbar,
-      so we apply the "disabled" class to the li to avoid
-      visually hinting that clicking it would do anything. --}}
-    {{#sandstormTopbarItem name="toggle-navbar disabled" topbar=globalTopbar}}
-      <div class="toggle-navbar-button">Sandstorm</div>
-      {{/sandstormTopbarItem}}
+    {{>sandstormTopbarItem name="login" topbar=globalTopbar data=globalAccountsUi
+                           template="loginButtons" popupTemplate="loginButtonsPopup"}}
   {{/if}}
-  {{>sandstormTopbarItem name="account" topbar=globalTopbar data=globalAccountsUi
-                         template="loginButtons" popupTemplate="loginButtonsPopup"}}
   {{#if currentUser}}
     {{>sandstormTopbarItem name="notifications" topbar=globalTopbar
-                           template="notifications" popupTemplate="notificationsPopup"}}
+                           template="notifications" popupTemplate="notificationsPopup"
+                           priority=-1}}
   {{/if}}
   {{!-- admin alerts --}}
   {{#with adminAlert}}
     {{#if adminAlertIsTooLarge}}
-      {{#sandstormTopbarItem name="admin-alert" topbar=globalTopbar}}
+      {{#sandstormTopbarItem name="admin-alert" topbar=globalTopbar priority=-2}}
         {{!-- TODO(cleaup): Awkwardly, the event handlers on Template.layout actually work
             on this topbar item solely because the whole topbar itself is embedded inside the
             "layout" template. But, we shouldn't be relying on that! Move this to its own
@@ -101,53 +110,53 @@ limitations under the License.
   {{/with}}
 
   {{#with billingPromptState}}
-    {{>billingPrompt}}
+    {{> Template.dynamic template=billingPromptTemplate}}
   {{/with}}
 
-  {{/if}}
-  <div class="main-content {{#if showNavbar}}show-navbar{{/if}}">
-    {{#unless firstLogin}}
-      {{> yield}}
+  {{/if}} {{!-- firstLogin --}}
+  {{/if}} {{!-- isAccountSuspended --}}
+  {{/if}} {{!-- identityUser --}}
+  {{/with}} {{!-- demoExpired --}}
+
+  {{!-- Make sure to always render the main-content div, but only yield if there is no interstitial
+        to render on top. The main-content div needs to be stable so that any GrainView that gets
+        attached does not get orphaned. For example, if the main-content div were inside the
+        {{#if firstLogin}} block, then grain views could appear to become blanked out when a demo
+        user upgrades to a real account by linking an email identity.
+   --}}
+  <div class="main-content{{#if hideNavbar}} hide-navbar{{else}}{{#if shrinkNavbar}} shrink-navbar{{/if}}{{/if}}{{#if isStandalone}} standalone{{/if}}">
+  {{#unless demoExpired}}
+    {{#unless identityUser}}
+      {{#unless firstLogin}}
+        {{> desktopNotifications "" }}
+        {{> yield}}
+      {{/unless}}
     {{/unless}}
+  {{/unless}}
   </div>
-  {{/with}}
-</template>
 
-<template name="grainView">
-  {{!-- This template is rendered manually using Blaze.renderWithData() for each currently-open
-        grain and then injected into .main-content. We do things manually so that we can be
-        sure that adding or removing grains from the open grain list does not cause other grains'
-        iframes to be re-rendered, losing state. --}}
-  {{#with unpackedGrainState}}
-    <div class="grain-container {{#if active}}active-grain{{else}}inactive-grain{{/if}}">
-    {{#if error}}
-      <pre>{{error}}</pre>
-    {{else}}
-    {{#if appOrigin}}
-      {{!-- Selenium requires iframes to have an id in order to select them. id="grain-frame" is only
-            used for testing purposes. --}}
-      <iframe data-grainid="{{grainId}}" id="grain-frame" class="grain-frame" src="{{appOrigin}}/_sandstorm-init?sessionid={{sessionId}}&path={{originalPath}}"></iframe>
-      {{#if hasNotLoaded}}
-        {{> _grainSpinner}}
-      {{/if}}
-    {{else}}
-    {{#if interstitial}}
-      <div class="interstitial-button-box">
-        <p>This grain was shared by someone who is not in your contacts.</p>
-        <button class="redeem-token-button" data-token="{{token}}">Reveal your Identity</button>
-        <button class="incognito-button" data-token="{{token}}">Open in Incognito Mode</button>
+  {{#with demoModal}}
+    {{#modalDialogWithBackdrop onDismiss=dismissDemoModal class="demo-startup-modal"}}
+      <div class="top">
+          <p class="header">Sandstorm is a self-hostable web productivity suite.</p>
+          <p class="body">
+          {{#if appdemo}}
+            with apps like {{appdemo}}.
+          {{else}}
+            with all the apps you need in one place.
+          {{/if}}</p>
+
+          <button class="button-primary start">
+            {{#if appdemo}}Try {{appdemo}}{{else}}Start{{/if}} &raquo;
+          </button>
+
       </div>
-    {{else}}
-      {{> _grainSpinner}}
-    {{/if}}
-    {{/if}}
-    {{/if}}
-    </div>
+      <div class="bottom">
+        <p>Sandstorm makes it easy to run apps on your own server. In addition to improving privacy and control, <a href="https://blog.sandstorm.io/news/2014-07-21-open-source-web-apps-require-federated-hosting.html" target="_blank">this brings Open Source apps to a wide audience.</a></p>
+        <p>Sandstorm is also ridiculously secure. If security interests you, check out <a href="https://docs.sandstorm.io/en/latest/developing/security-practices/" target="_blank">Sandstorm's security model overview</a>.</p>
+      </div>
+    {{/modalDialogWithBackdrop}}
   {{/with}}
-</template>
-
-<template name="invalidToken">
-   <pre> Invalid token: {{token}} </pre>
 </template>
 
 <template name="noLayout">
@@ -157,28 +166,23 @@ limitations under the License.
 </template>
 
 <template name="notifications">
+  <button class="show-popup icon icon-notification" title="Notifications">
   {{#if notificationCount}}
     <span class="count">{{notificationCount}}</span>
   {{/if}}
   Notifications
+  </button>
 </template>
 
 <template name="notificationsPopup">
   <h4>Notifications</h4>
-  <ul id="notification-list">
+  <ul class="notification-list">
     {{#each notifications}}
       <li>
-        <div class="notification-item">
-          <div class="notification-header">
-              <span>{{grainTitle}}</span>
-              <span title="Stops the background app" class="cancel-notification" data-notificationid="{{_id}}">Cancel</span>
-              <span title="{{timestamp}}" class="notification-timestamp">{{dateString timestamp}}</span>
-          </div>
-          <span>{{text.defaultText}}</span>
-        </div>
+        {{> notificationItem .}}
       </li>
     {{else}}
-    <li>No Notifications...</li>
+    <li>No notifications...</li>
     {{/each}}
   </ul>
 </template>
@@ -207,432 +211,43 @@ limitations under the License.
 <template name="root">
   {{>title "Home"}}
 
-  <div id="intro">
-    {{#if isFirstRun}}
-      <p>
-        This Sandstorm instance has no users. You should generate a token from the command line
-        with `sandstorm admin-token` in order to access the admin settings page.
-      </p>
-    {{else}}
-      {{> loginButtonsDialog globalAccountsUi}}
+  <div id="intro" class="{{#if splashUrl}}has-splash{{/if}}">
+    {{> loginButtonsDialog accountsUi=globalAccountsUi}}
+    {{#if splashUrl}}
+      <iframe src="{{splashUrl}}"></iframe>
     {{/if}}
   </div>
 </template>
 
-<template name="grainTitle">
-  <span class="editable" title="Rename" id="grainTitle" tabindex="0">{{title}}</span>
-</template>
-<template name="grainDeleteButton">
-  <button class="grain-button" title="Delete" id="deleteGrain">Delete</button>
-</template>
-<template name="grainDebugLogButton">
-  <button class="grain-button" title="Show Debug Log" id="openDebugLog">Log</button>
-</template>
-<template name="grainBackupButton">
-  <button class="grain-button {{#if isLoading}}loading{{/if}}" title="Download Backup" id="backupGrain" disabled="{{#if isLoading}}true{{/if}}">Backup</button>
-</template>
-<template name="grainRestartButton">
-  <button class="grain-button" title="Restart App" id="restartGrain">Restart</button>
+<template name="apps">
+  {{> sandstormAppListPage . }}
 </template>
 
-<template name="grainApiTokenButton">
-  Get&nbsp;Webkey
+<template name="grains">
+  {{> sandstormGrainListPage . }}
 </template>
 
-<template name="grainApiTokenPopup">
-  <h4>Webkeys</h4>
-  {{#if generatedApiToken}}
-    {{#if generatedApiTokenPending}}
-      <p>Generating...</p>
-      <p><button id="resetApiToken">Cancel</button></p>
-    {{else}}
-      <p>Copy this webkey and give it to the external app:</p>
-        <a id="apiTokenText" class="copy-me" href="{{generatedApiToken}}">{{generatedApiToken}}</a>
-      {{#if currentUser}}
-        <p><button id="resetApiToken">Go back</button></p>
-      {{/if}}
-    {{/if}}
-  {{else}}
-    <p>A webkey allows you to connect an external app (e.g. a mobile app) to this app.</p>
-    <p><form class="newApiToken">
-    Label: <input type="text" id="api-token-petname" placeholder="e.g. 'Android app'">
-    {{#with viewInfo}}
-      {{#if roles}}
-        Role:
-        <select id="api-token-role">
-          <option title="has every app permission" selected=true>all access</option>
-          {{#each roles}}
-            <option title={{verbPhrase.defaultText}}
-                    data-obsolete={{obsolete}}>
-              {{title.defaultText}}</option>
-          {{/each}}
-        </select>
-      {{/if}}
-    {{/with}}
-    <button>Create</button></form></p>
-    {{#if existingTokens}}
-      <p>Your existing webkeys:</p>
-      <ul>
-      {{#each existingTokens}}
-        {{#if displayToken}}
-          <li>
-            <span class="token-petname" data-token-id="{{_id}}">
-              {{petname}} ({{dateString created}})
-            </span>
-            <button class="revoke-token" title="revoke" data-token-id="{{_id}}">revoke</button>
-          </li>
-        {{/if}}
-      {{/each}}
-      </ul>
-    {{/if}}
-  {{/if}}
+<template name="appDetails">
+  {{> sandstormAppDetailsPage . }}
 </template>
 
-<template name="grainShareButton">
-  Share
-</template>
-
-<template name="whoHasAccess">
-   <img src="/people.svg">
-</template>
-<template name="whoHasAccessPopup">
-  <h4 class="who-has-access">Who has access</h4>
-  <div class="tables-container">
-    <h5>People</h5>
-    {{#if transitiveShares.empty}}
-      {{#if existingShareTokens}}
-        <p>No logged-in users have visited your links yet.</p>
-      {{else}}
-        <p>You have granted access to nobody.</p>
-      {{/if}}
-    {{else}}
-      <table class="people">
-        {{#each transitiveShares}}
-          <tr>
-            <td> {{displayName recipient}} </td>
-            <td> added by
-              <ul>
-                {{#each shares}}
-                  <li>{{displayName userId}}</li>
-                {{/each}}
-              </ul>
-            </td>
-          </tr>
-        {{/each}}
-      </table>
-    {{/if}}
-    {{#if existingShareTokens}}
-      <h5>Sharing Links</h5>
-      <table class="shared-links">
-      {{!-- Renamed from sharing-links to shared-links due to a common adblock rule
-            in https://easylist.adblockplus.org/fanboy-social.txt --}}
-        {{#each existingShareTokens}}
-          {{#if displayToken}}
-            <tr>
-              <td>
-                <span class="token-petname" data-token-id="{{_id}}">
-                  {{getPetname}} ({{dateString created}})
-                </span>
-              </td>
-              <td>
-                {{#if viewInfo.roles}}
-                  <select class="share-token-role" data-token-id="{{_id}}">
-                    {{#each indexedRoles}}
-                      <option title={{title.defaultText}}
-                              data-obsolete={{obsolete}}
-                              selected={{hasCurrentRole ..}}>
-                        {{roleText}}</option>
-                    {{/each}}
-                    {{#if hasCustomRole .}}
-                      <option title="custom role" selected=true>
-                        [has custom permissions]
-                      </option>
-                    {{/if}}
-                  </select>
-                {{/if}}
-              </td>
-              <td>
-                <button class="revoke-token" title="revoke" data-token-id="{{_id}}">revoke</button>
-              </td>
-            </tr>
-          {{/if}}
-        {{/each}}
-      </table>
-      {{/if}}
-   </div>
-</template>
-
-<template name="selectRole">
-  {{#with viewInfo}}
-  {{#if roles}}
-  <select class="share-token-role" title="select a role">
-    {{#each roles}}
-    <option title={{title.defaultText}}
-            data-obsolete={{obsolete}}
-            {{!-- We need this special attributed because apparently Meteor does not play nice
-                  with HTMLOptionElement.defaultSelected. --}}
-            data-default-selected={{default}}
-            selected={{default}}>
-      {{roleText}}</option>
-    {{/each}}
-  </select>
-  {{/if}}
-  {{/with}}
-</template>
-
-<template name="emailInviteTab">
-  <form class="email-invite">
-    <p>
-    <img class="inline-icon" src="/people-m.svg" role="presentation">
-    <input onclick="select()" type="text"
-           class="emails" placeholder="Enter email addresses">
-    {{> selectRole viewInfo=viewInfo}}
-    </p>
-    <div>
-      <textarea class="personal-message"
-                placeholder="Type a personal message (optional)..."></textarea>
-    </div>
-    {{#if completionState.clear}}
-    <div class="button-container" role="presentation">
-      <button>Send</button>
-    </div>
-    {{/if}}
-  </form>
-  {{#with completionState}}
-    {{#if success}}
-     <p>Successfully sent.</p>
-     <p><button class="reset-invite">+ Send more invites</button></p>
-    {{/if}}
-    {{#if pending}}
-      <p>Sending...</p>
-    {{/if}}
-    {{#if error}}
-      <p> {{error}} </p>
-      <p><button class="reset-invite">&lt;&lt; Start over</button></p>
-    {{/if}}
-  {{/with}}
-</template>
-
-<template name="shareableLinkTab">
-  <form class="new-share-token">
-    <p>
-      <img class="inline-icon" src="/people-m.svg" role="presentation">
-      Anyone with this link{{#if viewInfo.roles}}:{{else}} can access the grain.{{/if}}
-      {{> selectRole viewInfo=viewInfo}}
-    </p>
-    <input type="text" class="label" placeholder="Label (optional)">
-    <p class="label-explanation">
-      Use a label to remind yourself to whom you sent this unique link.</p>
-    {{#if completionState.clear}}
-      <div class="button-container">
-        <button>Create</button>
-      </div>
-    {{/if}}
-  </form>
-  {{#with completionState}}
-    {{#if success}}
-      <p><img class="inline-icon" src="/copy-m.svg" role="presentation"> Copy this link:</p>
-      <a id="share-token-text" class="copy-me" href="{{success.url}}">{{success.url}}</a>
-      <p><button class="reset-share-token">+ Create another link</button></p>
-    {{/if}}
-    {{#if pending}}
-      <p>Generating...</p>
-      <p><button class="reset-share-token">Cancel</button></p>
-    {{/if}}
-  {{/with}}
-</template>
-
-<template name="shareWithOthers">
-  <h4 class="share-with-others">Share with others</h4>
-  {{#if grain.isOldSharingModel}}
-    <p>This grain uses the old sharing model. You can share it by copy/pasting the URL from the
-       location bar.</p>
-    {{#if grain.isOwner}}
-      <p>You can upgrade this grain to the new model, but anyone with whom you shared this grain
-         previously will lose access; you will have to share it with them again.</p>
-      <p>Upgrading cannot be undone.</p>
-      <p><button id="privatize-grain">upgrade</button></p>
-    {{/if}}
-  {{else}}
-  <div class="share-tabs" role="presentation">
-    <ul role="tablist">
-      <li id="send-invite-tab-header" tabindex="0" role="tab" aria-controls="send-invite-tab" aria-selected="true"> Send an invite </li>
-      <li id="shareable-link-tab-header" tabindex="-1" role="tab" aria-controls="shareable-link-tab" aria-selected="false"> Get shareable link </li>
-    </ul>
-    <div id="send-invite-tab" role="tabpanel" class="tabpanel" aria-labelledby="send-invite-tab-header" aria-hidden="false">
-      {{> emailInviteTab viewInfo=grain.viewInfo title=grain.title grainId=grain.grainId }}
-    </div>
-    <div id="shareable-link-tab" role="tabpanel" class="tabpanel" aria-labelledby="shareable-link-tab-header" aria-hidden="true">
-      {{> shareableLinkTab viewInfo=grain.viewInfo }}
-    </div>
-  </div>
-
-  <div class="footer">
-    <img class="inline-icon" src="/people-m.svg">
-    <button class="who-has-access">See who has access</button>
-  </div>
-  {{/if}}
-</template>
-
-<template name="grainSharePopup">
-  {{> shareWithOthers grain=currentGrain}}
-</template>
-
-<template name="grainPowerboxRequest">
-  P
-</template>
-<template name="grainPowerboxRequestPopup">
-  <h4>Powerbox Request</h4>
-  <div>
-    <form id="powerbox-request-form">
-      <label>Please input an api token: </label><input name="token" type="text" id="powerbox-request-input"><br>
-      <button class="submit">Import token</button>
-    </form>
-    {{#if error.get}}
-    <div class="error">{{error.get}}</div>
-    {{/if}}
-  </div>
-</template>
-
-<template name="grainPowerboxOffer">
-  P
-</template>
-<template name="grainPowerboxOfferPopup">
-  <h4>Powerbox Offer</h4>
-  <div>
-    <a class="copy-me" href="{{powerboxOfferUrl}}" id="powerbox-offer-url">{{powerboxOfferUrl}}</a>
-    <button class="dismiss">Dismiss</button>
-  </div>
-</template>
-
-<template name="grain">
-  {{>sandstormTopbarItem name="title" priority=5 topbar=globalTopbar template="grainTitle"}}
-  {{#sandstormTopbarItem name="grain-size" priority=5 topbar=globalTopbar}}
-    {{grainSize}}
-  {{/sandstormTopbarItem}}
-
-  {{>sandstormTopbarBlockReload}}
-
-  {{setGrainWindowTitle}}
-
-  {{#if currentUser}}
-    {{>sandstormTopbarItem name="share" topbar=globalTopbar
-          template="grainShareButton" popupTemplate="grainSharePopup"}}
-    {{>sandstormTopbarItem name="delete" topbar=globalTopbar template="grainDeleteButton"}}
-  {{/if}}
-  {{#if isOwner}}
-    {{>sandstormTopbarItem name="debug-log" topbar=globalTopbar template="grainDebugLogButton" data=globalTopbar}}
-    {{>sandstormTopbarItem name="backup" topbar=globalTopbar template="grainBackupButton" data=globalTopbar}}
-    {{>sandstormTopbarItem name="restart" topbar=globalTopbar template="grainRestartButton" data=globalTopbar}}
-  {{/if}}
-  {{#if displayWebkeyButton}}
-    {{>sandstormTopbarItem name="webkey" topbar=globalTopbar
-        template="grainApiTokenButton" popupTemplate="grainApiTokenPopup"}}
-  {{/if}}
-  {{#if showPowerboxRequest}}
-    {{>sandstormTopbarItem name="request" topbar=globalTopbar template="grainPowerboxRequest"
-        startOpen=true popupTemplate="grainPowerboxRequestPopup"}}
-  {{/if}}
-  {{#if showPowerboxOffer}}
-    {{>sandstormTopbarItem name="offer" topbar=globalTopbar template="grainPowerboxOffer"
-        startOpen=true popupTemplate="grainPowerboxOfferPopup"}}
-  {{/if}}
-
-</template>
-
-<template name="newGrain">
-  {{>title "Apps"}}
-  {{> sandstormAppList }}
-</template>
-
-<template name="selectGrain">
-  {{>title "Grains"}}
-  {{> sandstormGrainList}}
-</template>
-
-<template name="_grainSpinner">
-  {{!-- This is a terrible hack to center this thing. The styles shold go in css, but it's
-    arguably more confusing to put them there when all they're doing is this archaic pattern to
-    get a horizontally+vertically centered div --}}
-  <div id="grain-loading-spinner">
-    <div style="display:table-cell;vertical-align:middle;">
-      <div style="margin-left:auto;margin-right:auto;text-align:center;">
-        <img src="/spinner_96.gif" alt="loading">
-      </div>
-    </div>
-  </div>
+<template name="grainLogContents">
+  <pre>...{{{logHtml}}}</pre>
 </template>
 
 <template name="grainLog">
   <div class="grainlog-title">Debug log: {{title}}</div>
-  <div class="grainlog-contents">
-    <pre>...{{{html}}}</pre>
+  <div class="grainlog-contents" aria-live="polite">
+    {{> grainLogContents logHtml=html onRenderedHook=maybeScrollToBottom }}
   </div>
 </template>
 
 <template name="install">
-  {{>title "Install app"}}
-
-  {{#if error}}
-    <div id="install" class="error">
-      <div class="centered-box">
-        <p>Failed to install app!
-          {{#if step}}<button id="retry">Try Again</button>{{/if}}</p>
-        <pre>{{error}}</pre>
-      </div>
-    </div>
-  {{else}}
-    <div id="install" class="instep-{{step}}">
-      {{! TODO(cleanup):  The use of a list here is vestigial.  We now display only the step
-            that is currently running. }}
-      <ol>
-        <li id="step-wait">Waiting for write access...</li>
-        <li id="step-download">Downloading... <span class="progress">{{progress}}
-            <button id="cancelDownload">Cancel</button></span></li>
-        <li id="step-verify">Verifying... <span class="progress">{{progress}}</span></li>
-        <li id="step-unpack">Unpacking... <span class="progress">{{progress}}</span></li>
-        <li id="step-analyze">Analyzing... <span class="progress">{{progress}}</span></li>
-        <li id="step-confirm">Install this app?
-          <div class="confirm-form">
-            {{! TODO(someday):  Support editing action names (i.e. make them petnames). }}
-            {{#if hasOlderVersion}}
-              <p>You have an older version of this app installed.  Do you want to upgrade?</p>
-              <p><button id="confirmInstall">Upgrade</button></p>
-            {{else}}
-            {{#if hasNewerVersion}}
-              <p>You already have a newer version of this app installed.  Are
-                you sure you want to revert to this older version?</p>
-              <p><button id="confirmInstall">Downgrade</button></p>
-            {{else}}
-              <p>Do you want to install this app?</p>
-              <p><button id="confirmInstall">Install</button></p>
-            {{/if}}
-            {{/if}}
-          </div></li>
-        <li id="step-run">App Installed
-          <div class="done-notice">
-            <p>Installation complete.  Click "New ..." to create a new file with this app.</p>
-
-            {{#if hasNewerVersion}}
-              <p>Some of your files were made with a
-                <a href="{{newVersionId}}">newer version</a> of this app.  They will keep
-                using the newer version, as going backwards could break them.</p>
-            {{else}}
-            {{#if hasOlderVersion}}
-              <p>Some of your files were made with an older version of this app.  Upgrade them?</p>
-              <p><button id="upgradeGrains">Upgrade Files</button></p>
-            {{else}}
-              <div id="my-files-arrow"></div>
-            {{/if}}
-            {{/if}}
-          </div></li>
-        <li id="step-delete">Server is currently deleting this app...</li>
-      </ol>
-    </div>
-  {{/if}}
+  {{> sandstormAppInstallPage . }}
 </template>
 
 <template name="account">
+{{!-- Data context is an instance of SandstormAccountSettingsUi --}}
   <div class="account">
     {{#if .}}
       {{>sandstormAccountSettings .}}
@@ -645,8 +260,12 @@ limitations under the License.
 
   <div class="centered-box">
   {{#if alreadySignedUp}}
-    <p>You're all signed up!  Now go <a href="https://apps.sandstorm.io/?host={{origin}}">install
-      some apps</a>.</p>
+    {{#if keyIsUsed}}
+      <p>You're all signed up!  Now go <a href="https://apps.sandstorm.io/?host={{origin}}">install
+        some apps</a>.</p>
+    {{else}}
+      <p>It looks like you already have an account, so you don't need this signup key.</p>
+    {{/if}}
   {{else}}
     {{#if keyIsValid}}
       {{#if keyIsUsed}}
@@ -662,93 +281,6 @@ limitations under the License.
     {{else}}
       <p>Sorry, this is not a valid signup key.</p>
     {{/if}}
-  {{/if}}
-  </div>
-</template>
-
-<template name="adminInvites">
-  <div id="invite">
-    {{#if error}}
-      <p>{{error}}</p>
-      <p><button id="retry">Try Again</button></p>
-    {{else}}{{#if url}}
-      <p>New key: <input type="text" class="autoSelect" value="{{url}}" readonly></p>
-      <p>Send this key to someone to allow them to create an account on your server.</p>
-      <p><button id="retry">Create Another</button></p>
-    {{else}}{{#if sent}}
-      <p>Sent!</p>
-      <p><button id="retry">Send more</button></p>
-    {{else}}
-      <p>You can invite friends to create accounts on your server. People you invite will be
-        able to install apps and create files of their own. You do NOT need to invite someone
-        if you just want to share your files with them.</p>
-      <h3>Create a link:</h3>
-      <p>This will create a magic link which you can send to someone.</p>
-      <p>
-        {{#if quotaEnabled}}
-          Quota: <input id="key-quota" type="text" placeholder="(bytes; blank for none)"><br>
-        {{/if}}
-        <input id="key-note" type="text" placeholder="notes, e.g. name of the recipient">
-        <button id="create">Create</button></p>
-
-      <h3>Send an e-mail:</h3>
-      <p>This will create a link and send it in an e-mail. <code>$KEY</code> will be replaced
-        with the newly-generated link.</p>
-      <div style="text-align: right; margin-top: 1em;">
-        <p>From: <input type="text" id="invite-from" placeholder="me@example.com" value="{{email}}"></p>
-        <p>To:
-        <textarea id="invite-emails" placeholder="E-mail addresses, one per line."></textarea></p>
-        <p>Subject: <input type="text" id="invite-subject" value="Join my Sandstorm server!"></p>
-        <p>Body:
-        <textarea id="invite-message">Click on the following link to get access to my Sandstorm.io server.
-
-  $KEY</textarea></p>
-        {{#if quotaEnabled}}
-          <p>Quota: <input id="invite-quota" type="text" placeholder="(bytes; blank for none)"></p>
-        {{/if}}
-        <p><button id="send">Send</button></p>
-      </div>
-
-      {{#if quotaEnabled}}
-        <h3>Update quotas:</h3>
-        <p>You can batch modify existing users' quotas by specifying the e-mail address under which they were invited. This only works for user who were invited using the "Send an e-mail" form, above.</p>
-        <div style="text-align: right; margin-top: 1em;">
-          <p>Emails:
-          <textarea id="set-quota-emails" placeholder="E-mail addresses, one per line."></textarea></p>
-          <p>Quota: <input id="set-quota-quota" type="text" placeholder="(bytes; blank for none)"></p>
-          <p><button id="set-quota-submit">Update</button></p>
-        </div>
-      {{/if}}
-    {{/if}}
-    {{/if}}
-    {{/if}}
-  </div>
-</template>
-
-<template name="adminLog">
-  <div id="adminLog">
-    <pre>...{{{html}}}</pre>
-  </div>
-</template>
-
-<template name="uploadForm">
-  {{>title "Upload App"}}
-
-  <div id="upload" class="centered-box">
-  {{#if isSignedUp}}
-    {{#if progress}}
-      <p>Uploading... {{progress}}%</p>
-    {{else}}
-      {{#if error}}
-        <p>Upload failed: {{error.status}} {{error.statusText}}</p>
-      {{else}}
-        <p>Please choose an <code>spk</code> file to install.</p>
-      {{/if}}
-      <p><input type="file" id="uploadFile">
-         <button id="uploadButton">Upload</button></p>
-    {{/if}}
-  {{else}}
-    <p>Sorry, this server requires an invite before you can install apps.</p>
   {{/if}}
   </div>
 </template>
@@ -770,335 +302,116 @@ limitations under the License.
   </div>
 </template>
 
-<template name="_adminConfigureLoginServiceDialog">
-  {{#if visible}}
-    <div id="configure-login-service-dialog" class="accounts-dialog accounts-centered-dialog">
-      {{> configurationSteps}}
+<template name="uploadTest">
+  {{>title "Upload test page"}}
 
-      <p>
-        Now, copy over some details.
-      </p>
-      <p>
-        <table>
-          <colgroup>
-            <col span="1" class="configuration_labels">
-            <col span="1" class="configuration_inputs">
-          </colgroup>
-          {{#each configurationFields}}
-            <tr>
-              <td>
-                <label for="configure-login-service-dialog-{{property}}">{{label}}</label>
-              </td>
-              <td>
-                <input id="configure-login-service-dialog-{{property}}" type="text" value="{{value}}">
-              </td>
-            </tr>
-          {{/each}}
-        </table>
-      </p>
-      <div class="new-section">
-        <div class="login-button configure-login-service-dismiss-button">
-          Cancel
-        </div>
-        <a class="accounts-close configure-login-service-dismiss-button">&times;</a>
+  <p>This page is intended for use by the test scripts.</p>
 
-        <div class="login-button login-button-configure"
-             id="configure-login-service-dialog-save-configuration">
-          Save Configuration
-        </div>
-      </div>
-    </div>
-  {{/if}}
+  <p>Upload app: <input type="file" id="upload-app"></p>
+  <p>Upload backup: <input type="file" id="upload-backup"></p>
 </template>
 
-<template name="admin">
-  {{>title "Admin Settings"}}
+<template name="referrals">
+  {{#if referralsEnabled}}
+  {{>title "Referral Program"}}
+  {{setDocumentTitle}}
+  <div class="referrals">
+    <h1>Referral Program</h1>
+    <header>
+      {{#if isPaid}}
+      <h2>Get up to <span class="reward-amount">30 GB</span> of free space when your friends share on Oasis!</h2>
+      {{else}}
+      <h2>Get unlimited grains &amp; up to <span class="reward-amount">2 GB</span> of free space when
+        your friends share on Oasis!</h2>
+      {{/if}}
 
-  {{> _adminConfigureLoginServiceDialog}}
-  <div id="admin-settings" class="centered-box">
-    {{#if isUserPermitted}}
-      <ul id="settings-tabs" class="nav centered-box">
-        <li id="settings-tab" class="{{#if settingsActive}}active{{/if}}">
-          {{#linkTo route="adminSettings" data=getToken}}Settings{{/linkTo}}
+      {{#if isPaid}}
+      <p>
+        For each friend that creates a sharing link, we'll reward you with 2 GB.
+      </p>
+      {{else}}
+      <p>
+        For each friend that creates a sharing link, we'll reward you with 50 MB.
+        You'll also get unlimited grains.
+      </p>
+      {{/if}}
+    </header>
+    <section>
+      <h1>Sharing is referring</h1>
+      <p>To get started, open any grain and click Share access.</p>
+
+      <div class="image-tutorial">
+      <ol>
+        <li>You share a grain with your friend (who isn't already an Oasis user).
+          <img src="/referral-graphics/referral-1.svg">
         </li>
-        <li id="users-tab" class="{{#if usersActive}}active{{/if}}">
-          {{#linkTo route="adminUsers" data=getToken}}Users{{/linkTo}}
+        <li>Your friend signs in.
+          <img src="/referral-graphics/referral-2.svg">
         </li>
-        <li id="stats-tab" class="{{#if statsActive}}active{{/if}}">
-          {{#linkTo route="adminStats" data=getToken}}Stats{{/linkTo}}
+        <li>Your friend shares a grain with any other person (including you).
+          <img src="/referral-graphics/referral-3.svg">
         </li>
-        <li id="log-tab" class="{{#if logActive}}active{{/if}}">
-          {{#linkTo route="adminLog" data=getToken}}Log{{/linkTo}}
-        </li>
-        <li id="invites-tab" class="{{#if invitesActive}}active{{/if}}">
-          {{#linkTo route="adminInvites" data=getToken}}Send Invite{{/linkTo}}
-        </li>
-        <li id="caps-tab" class="{{#if capsActive}}active{{/if}}">
-          {{#linkTo route="adminCaps" data=getToken}}Capabilities{{/linkTo}}
-        </li>
-        <li id="advanced-tab" class="{{#if advancedActive}}active{{/if}}">
-          {{#linkTo route="adminAdvanced" data=getToken}}Advanced{{/linkTo}}
-        </li>
+      </ol>
+
+      </div>
+
+      {{#if currentUser}}
+      <h2>Your referrals &amp; status</h2>
+
+      <p>Once you send a sharing link out, people will appear in this list
+        after they sign in.</p>
+
+      {{#with notYetCompleteReferralNames}}{{#if this.count}}
+      <h3>Still needs to share</h3>
+
+      <p class="gentle-hint">Tell these people to make a grain and share it with you. You
+        must actually view the grain they shared with you!</p>
+
+      <ul class="comma-separated-ul">
+        {{#each this}}
+        <li>{{name}}</li>
+        {{/each}}
       </ul>
-      {{> Template.dynamic template=adminTab}}
-      {{#if success}}
-      <div class="alert alert-success {{#if fadeAlert}}fade-out{{/if}}"><strong>Success!</strong> {{successMessage}}</div>
-      {{/if}}
-      {{#if failure}}
-      <div class="alert alert-danger {{#if fadeAlert}}fade-out{{/if}}"><strong>Failure!</strong>
-        <ul>
-          {{#each errors}}
-          <li>{{reason}}</li>
-          {{/each}}
-        </ul>
-        For internal server errors, see <code>&lt;install-location&gt;/var/log/sandstorm.log</code> for details.
-      </div>
-      {{/if}}
-    {{else}}
-      <p>
-        You are not logged in as admin and there isn't a valid token specified. You should
-        either log in as an admin user or generate a token from the command line by doing
-        `sandstorm admin-token` in order to access the admin settings page.
+
+      {{/if}}{{/with}}
+
+      {{#with completeReferralNames}}{{#if this.count}}
+      <h3>Successful referrals</h3>
+
+      <p class="gentle-hint">You've successfully referred these people. Congratulations!</p>
+
+      <ul class="comma-separated-ul">
+        {{#each this}}
+        <li>{{name}}</li>
+        {{/each}}
+      </ul>
+
+      {{/if}}{{/with}}
+
+      <h2 class="fine-print">The fine print</h2>
+
+      <p>Your referral bonus lasts until 1 year after the
+          referral. The terms of this referral program may
+          change without warning; however, such changes will not affect
+          bonuses you have already received. If you need even more
+          space, <a href="{{pathFor route='account'}}">upgrade your
+          account.</a>
       </p>
-    {{/if}}
+
+      <p>Paid subscribers can get up to 30 GB of free storage, 2 GB per
+        person they refer, in addition to the storage from their
+        account level. Free account holders can earn unlimited grains
+        and 50 MB of free storage per person they refer, up to 2 GB
+        total.</p>
+
+      {{/if}}
+    </section>
   </div>
-</template>
-
-<template name="adminSettings">
-  <form id="admin-settings-form">
-    <p>
-      <label><input type="checkbox" class="oauth-checkbox" name="googleLogin"
-             value="value" checked={{googleEnabled}} data-servicename="google"> Enable Google Login
-       (<a class="configure-oauth" data-servicename="google" href="">configure</a>)
-       (<a class="reset-login-tokens" data-servicename="google" href="">log out all users</a>)</label><br>
-       <label><input type="checkbox" class="oauth-checkbox" name="githubLogin"
-              value="value" checked={{githubEnabled}} data-servicename="github"> Enable Github Login
-       (<a class="configure-oauth" data-servicename="github" href="">configure</a>)
-       (<a class="reset-login-tokens" data-servicename="github" href="">log out all users</a>)</label><br>
-       <label><input type="checkbox" name="emailTokenLogin" value="value" checked={{emailTokenEnabled}}> Enable Passwordless Email Login</label><br>
-      <span class="details">Choose which services users may use to identify themselves. Anyone can log in, but only users you {{#linkTo route="adminInvites" data=getToken}}invite{{/linkTo}} will be able to install apps or create files.</span></p>
-    <p>SMTP Url: <button id="admin-settings-send-toggle">Test</button><input id="smptUrl" type="text" name="smtpUrl" value="{{smtpUrl}}"><br>
-      <span class="details">Address of an SMTP relay server, like <code>smtp://user:pass@host:port</code>, which will be used by email apps and to send {{#linkTo route="adminInvites" data=getToken}}email invites{{/linkTo}}. The SMTP server should be configured to allow sending email from your Sandstorm domain and from email addresses that will be used to send invites.</span>
-    </p>
-    {{#if isEmailTestActive}}
-      <p>
-        Send test email to: <input id="email-test-to" type="text">
-        <p><button id="admin-settings-send-test">Send</button></p>
-      </p>
-    {{/if}}
-    <p><button id="admin-settings-save">Save</button></p>
-  </form>
-</template>
-
-<template name="adminUsers">
-  <table class="admin-table">
-    <thead>
-      <tr>
-        <td>Service</td>
-        <td>Username</td>
-        <td>Name</td>
-        <td>User Class</td>
-        {{#if quotaEnabled}}
-          <td>Plan</td>
-          <td>Used</td>
-        {{/if}}
-        <td>Created</td>
-        <td>Last Active</td>
-        <td>Invited as</td>
-      </tr>
-    </thead>
-    <tbody>
-      {{#each users}}
-        <tr>
-          <td>{{userService}}</td>
-          <td>{{userName}}</td>
-          <td>{{profile.name}}</td>
-          <td>
-            <select class="user-class" name="select">
-              <option value="admin" selected={{#if userIsAdmin}}selected{{/if}}>Admin</option>
-              <option value="invited" selected={{#if userIsInvited}}selected{{/if}}>Invited User</option>
-              <option value="guest" selected={{#if userIsGuest}}selected{{/if}}>Guest</option>
-            </select>
-          </td>
-          {{#if quotaEnabled}}
-            <td>{{plan}}</td>
-            <td>{{userStorageUsage}}</td>
-          {{/if}}
-          <td title="{{createdAt}}">{{dateString createdAt}}</td>
-          <td title="{{lastActive}}">{{dateString lastActive}}</td>
-          <td>{{userSignupNote}}</td>
-        </tr>
-      {{/each}}
-    </tbody>
-  </table>
-</template>
-
-<template name="adminStats">
-  <div id="stats">
-    <p>Right now: {{current.activeUsers}} users, {{current.activeGrains}} grains</p>
-    <p>Today: {{today.activeUsers}} users, {{today.activeGrains}} grains</p>
-
-    <p>Previous days:</p>
-
-    <table>
-      <tr>
-        <td rowspan="2">date</td>
-        <td colspan="3">users</td>
-        <td colspan="3">grains</td>
-      </tr>
-      <tr>
-        <td>daily</td>
-        <td>weekly</td>
-        <td>monthly</td>
-        <td>daily</td>
-        <td>weekly</td>
-        <td>monthly</td>
-      </tr>
-      {{#each points}}
-        <tr>
-          <td>{{day}}</td>
-          <td>{{daily.activeUsers}}</td>
-          <td>{{weekly.activeUsers}}</td>
-          <td>{{monthly.activeUsers}}</td>
-          <td>{{daily.activeGrains}}</td>
-          <td>{{weekly.activeGrains}}</td>
-          <td>{{monthly.activeGrains}}</td>
-        </tr>
-      {{else}}
-        <tr>
-          <td colspan="7">There are no stats yet, or you are not admin.</td>
-        </tr>
-      {{/each}}
-    </table>
-    <h3>API token</h3>
-    <button id="regenerateStatsToken">Regenerate Token</button>
-    <span><a href="/fetchStats/{{token._id}}">{{token._id}}</a></span>
-  </div>
-</template>
-
-<template name="adminCaps">
-  {{#if powerboxOfferUrl}}
-    {{#with powerboxOfferUrl=powerboxOfferUrl}}
-      {{>sandstormTopbarItem name="offer" topbar=globalTopbar template="grainPowerboxOffer"
-          startOpen=true popupTemplate="grainPowerboxOfferPopup"}}
-    {{/with}}
   {{/if}}
-  <p><button id="offer-ipnetwork">Offer IpNetwork Capability</button>
-     <button id="offer-ipinterface">Offer IpInterface Capability</button><br>
-    <span class="details">These buttons create webkeys (special secret addresses) representing permission to directly access the network. IpNetwork represents the capability to make outbound requests to the network. IpInterface represents the capability to receive inbound connections on the machine's main network interface. Some apps -- especially drivers -- will ask for these permissions. To grant them, you'll need to copy/paste the webkey from here into the app's request box. (Eventually, this UI will be superseded by the Powerbox picker.)</span></p>
-  <hr>
-  <table class="admin-table">
-    <thead>
-      <tr>
-        <td>Type</td>
-        <td>User</td>
-        <td>Created</td>
-      </tr>
-    </thead>
-    <tbody>
-      {{#each caps}}
-        <tr class="{{#if disabled}}revoked-cap{{/if}}">
-          <td>{{#if frontendRef.ipNetwork}}IpNetwork{{/if}}{{#if frontendRef.ipInterface}}IpInterface{{/if}}</td>
-          <td>{{userName}}</td>
-          <td title="{{created}}">{{dateString created}}</td>
-          <td><a class="disable-cap" data-id="{{_id}}">x</a></td>
-        </tr>
-      {{/each}}
-    </tbody>
-  </table>
-</template>
-
-<template name="adminAdvanced">
-  <form id="admin-settings-form">
-    <p>Splash Dialog: <input type="text" name="splashDialog" value="{{splashDialog}}"><br>
-       Signup Dialog: <input type="text" name="signupDialog" value="{{signupDialog}}"><br>
-      <span class="details">This will be used as text in the splash page and signup page respectively.</span></p>
-    <p>Terms of Service URL: <input type="text" name="termsUrl" value="{{termsUrl}}"><br>
-       Privacy Policy URL: <input type="text" name="privacyUrl" value="{{privacyUrl}}"><br>
-      <span class="details">If provided, new users will be required to agree to these.</span></p>
-    <p>Admin Alert: <input type="text" name="adminAlert" value="{{adminAlert}}"><br>
-       Alert Time (e.g. "5/9/2022 6:00 PM"): <input id="alertTime" type="text" name="alertTime" value="{{alertTime}}"><br>
-       Alert URL (optional): <input id="alertUrl" type="text" name="alertUrl" value="{{alertUrl}}"><br>
-      <span class="details">
-        This will be shown to all users in the topbar, on the right. If the alert text is
-        empty, no alert will be displayed. You can use the following variables that will be replaced
-        automatically:
-        <ul>
-          <li>$TIME : The time component of Alert Time, converted to the user's local time (eg. "1:15:45 PM")</li>
-          <li>$DATE : The date component of Alert Time, converted to the user's local time (eg. "6/19/2015")</li>
-          <li>$IN_COUNTDOWN : An active countdown until Alert Time (eg. "in 3 days" or "in 1 minute"). Displays "any moment" at the alert time and then disappears after an hour. Useful for announcing scheduled maintenance.</li>
-          <li>$ACCOUNT_EXPIRES : The time when the viewer's demo account expires (this is only useful for demo servers)</li>
-          <li>$ACCOUNT_EXPIRES_IN : An active countdown until the viewer's demo account is deleted (this is only useful for demo servers)</li>
-          <li>$APPNAME : The name of the current app (this variable also works for "Alert URL").</li>
-        </ul>
-      </span>
-    </p>
-    <p><button id="admin-settings-save">Save</button></p>
-  </form>
-</template>
-
-<template name="appdemo">
-  {{> drydemo}}
-</template>
-
-<template name="demo">
-  {{> drydemo}}
-</template>
-
-<template name="drydemo">
-  {{>title pageTitle}}
-
-  <div class="demo-box">
-    {{#if allowDemo}}
-      {{#if appName}}
-        <h2><a href="https://sandstorm.io" target="_blank">Sandstorm</a> is an open source platform for running apps like {{appName}}.</h2>
-      {{else}}
-        <h2><a href="https://sandstorm.io" target="_blank">Sandstorm</a> is an open source platform for personal instances of web apps.</h2>
-      {{/if}}
-
-      <button class="start">
-        {{#if appName}}
-          Try {{appName}} &#9654;
-        {{else}}
-          Try a quick demo &#9654;
-        {{/if}}
-      </button>
-
-      <p>Sandstorm makes it easy to run apps on your own server. In addition to improving privacy and control, <a href="https://blog.sandstorm.io/news/2014-07-21-open-source-web-apps-require-federated-hosting.html" target="_blank">this is the only way to make Open Source web apps viable.</a></p>
-      <p>Sandstorm is also <strong>ridiculously secure</strong>. If security interests you, check out <a href="https://docs.sandstorm.io/en/latest/developing/security-practices/" target="_blank">Sandstorm's security model overview</a>.</p>
-    {{else}}
-      <p>Sorry, this server does not allow demo accounts.</p>
-    {{/if}}
-  </div>
-</template>
-
-<template name="devAccounts">
-  {{>title pageTitle}}
-
-  <div class="dev-accounts centered-box">
-    <h2>Developer Accounts</h2>
-    {{#if shouldShowStartDevAccounts}}
-      {{#if loggingIn}}
-        <p>Logging in...</p>
-      {{else}}
-        <button id="loginAliceDevAccount" class="devLogin">Log in as Alice (admin) »</button>
-        <button id="loginBobDevAccount" class="devLogin">Log in as Bob »</button>
-        <button id="loginCarolDevAccount" class="devLogin">Log in as Carol »</button>
-        <button id="loginDaveDevAccount" class="devLogin">Log in as Dave »</button>
-        <button id="loginEveDevAccount" class="devLogin">Log in as Eve »</button>
-      {{/if}}
-    {{else}}
-        <p>You are already logged in.</p>
-        <p><button onclick="browseHome()">See your apps »</button></p>
-    {{/if}}
-
-    <h3>What is this?</h3>
-    <p>This page is only for developer Sandstorm instances (ie. the ALLOW_DEV_ACCOUNTS setting
-    is enabled in your sandstorm.conf).</p>
-  </div>
 </template>
 
 <template name="about">
+  {{setDocumentTitle}}
   {{>title "About Sandstorm"}}
 
   <div class="about">
@@ -1118,13 +431,13 @@ limitations under the License.
     </section>
 
     <section class="changelog">
-      <h2>Recent Changes</h2>
+      <h2>Recent changes</h2>
 
-      {{> changelog}}
+      {{> changelog ""}}
     </section>
 
     <section class="developers">
-      <h2>Core Developers</h2>
+      <h2>Core developers</h2>
       <ul>
         <li><a href="https://github.com/kentonv">
             <img src="/logos/kenton.png" alt="Kenton Varda">
@@ -1173,7 +486,7 @@ limitations under the License.
     </section>
     <br>
     <section class="corporate">
-      <h2>Corporate Sponsors</h2>
+      <h2>Corporate sponsors</h2>
       <p>These companies contributed heavily to Sandstorm's <a href="http://igg.me/at/sandstorm">crowdfunding campaign</a>.</p>
       <ul>
         <li><a href="http://draw.io"><img width="92.75" height="121" src="/logos/draw.io-logo.svg">&nbsp;</a></li><li>
@@ -1182,7 +495,7 @@ limitations under the License.
       </ul>
       <div class="strut"></div>
     </section><section class="individual">
-      <h2>Key Invididual Sponsors</h2>
+      <h2>Key invididual sponsors</h2>
       <p>These individuals contributed heavily to Sandstorm's <a href="http://igg.me/at/sandstorm">crowdfunding campaign</a>.</p>
       <ul>
       <li><a href="http://rogerwagner.com/">
@@ -1224,13 +537,13 @@ limitations under the License.
         <li><a href="https://github.com/EventedMind/iron-router">Iron Router</a> (MIT license)</li>
         <li><a href="http://underscorejs.org/">Underscore.js</a> (MIT license)</li>
         <li><a href="http://www.senchalabs.org/connect/">Connect middleware</a> (MIT license)</li>
-        <li><a href="https://www.npmjs.org/package/es6-promises">ES6-Promise polyfill by Dmitry Korobkin</a> (MIT license)</li>
         <li><a href="https://www.google.com/fonts/specimen/Source+Sans+Pro">Source Sans Pro font</a> (SIL OFL)</li>
         <li><a href="https://github.com/joyent/http-parser">Node/nginx HTTP parser library</a> (MIT license)</li>
         <li><a href="https://github.com/andris9/simplesmtp">Simple SMTP by Andris Reinman</a> (MIT license)</li>
         <li><a href="https://github.com/justmoon/node-bignum">node-bignum by Stefan Thomas</a> (MIT license)</li>
         <li><a href="https://github.com/drudru/ansi_up">ansi_up library by Dru Nelson</a> (MIT license)</li>
         <li><a href="https://github.com/stewartlord/identicon.js">identicon.js by Stewart Lord</a> (BSD license)</li>
+        <li><a href="https://github.com/usablica/intro.js">intro.js by Afshin Mehrabani</a> (MIT license)</li>
         <li><a href="http://www.xarg.org/2010/03/generate-client-side-png-files-using-javascript/">PNGlib by Robert Eisele</a> (BSD license)</li>
         <li><a href="http://libb64.sourceforge.net/">libb64 by Chris Venter</a> (Public Domain)</li>
         <li><a href="http://tukaani.org/xz/">XZ Utils</a> (Public Domain / GPL)</li>
@@ -1257,8 +570,8 @@ limitations under the License.
     <section class="terms">
       <ul>
         <li><a href="https://github.com/sandstorm-io/sandstorm/blob/master/LICENSE">License</a></li>
-        {{#with termsUrl}}<li><a href="{{.}}">Terms of Service</a></li>{{/with}}
-        {{#with privacyUrl}}<li><a href="{{.}}">Privacy Policy</a></li>{{/with}}
+        {{#with termsUrl}}<li><a href="{{.}}">Terms of service</a></li>{{/with}}
+        {{#with privacyUrl}}<li><a href="{{.}}">Privacy policy</a></li>{{/with}}
       </ul>
     </section>
   </div>

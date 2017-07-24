@@ -19,6 +19,7 @@
 
 #include "abstract-main.h"
 #include <kj/io.h>
+#include <unistd.h>
 
 namespace sandstorm {
 
@@ -32,6 +33,7 @@ public:
   bool setRestore();
   bool setFile(kj::StringPtr arg);
   bool setRoot(kj::StringPtr arg);
+  bool setUid(kj::StringPtr arg);
   bool run(kj::StringPtr grainDir);
 
 private:
@@ -39,9 +41,11 @@ private:
   bool restore = false;
   kj::StringPtr filename;
   kj::StringPtr root = "";
+  kj::Maybe<uid_t> sandboxUid;
 
   void writeSetgroupsIfPresent(const char *contents);
   void writeUserNSMap(const char *type, kj::StringPtr contents);
+  void bind(kj::StringPtr src, kj::StringPtr dst, unsigned long flags);
   static void pump(kj::InputStream& in, kj::OutputStream& out);
   bool findFilesToZip(kj::StringPtr path, kj::OutputStream& out);
 };

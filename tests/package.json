@@ -3,9 +3,7 @@
   "description": "Tests for the sandstorm platform",
   "version": "0.0.1",
   "devDependencies": {
-    "nightwatch": "0.6.11",
-    "phantomjs": "~1.9.10",
-    "selenium-standalone": "4.2.2"
+    "nightwatch": "0.8.15"
   },
   "repository": {
     "type": "git",
@@ -19,6 +17,10 @@
     "mailcomposer": "^0.2.12",
     "mailparser": "0.5.1",
     "simplesmtp": "0.3.35",
-    "underscore": "^1.8.3"
+    "spacejam": "1.2.2",
+    "underscore": "^1.8.3",
+    "firefox-profile": "^0.3.11",
+    "jszip": "^2.5.0",
+    "es6-promise": "^3.0.2"
   }
 }
